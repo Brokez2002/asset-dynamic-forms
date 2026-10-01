@@ -1,6 +1,7 @@
 import api, { route } from '@forge/api';
 import Resolver from '@forge/resolver';
 import { kvs } from '@forge/kvs';
+import { doSync } from './sync';
  
 const UIM_NAME = 'asset-dynamic-forms';
 const JSON_HEADERS = { 'Content-Type': 'application/json', Accept: 'application/json' };
@@ -227,4 +228,5 @@ resolver.define('getConfigById', async ({ payload }) => {
 const configs = (await kvs.get('configs')) || [];
 return configs.find((c) => c.id === payload.configId) || null;
 });
+resolver.define('runSyncNow', async () => doSync());
 export const handler = resolver.getDefinitions();
