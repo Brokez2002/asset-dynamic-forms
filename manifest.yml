@@ -7,11 +7,22 @@ modules:
         function: resolver
       unlicensedAccess:
         - customer
+  jira:adminPage:
+    - key: asset-dynamic-forms-admin
+      title: Asset Dynamic Forms
+      resource: adminPage
+      resolver:
+        function: resolver
+      render: native
   trigger:
     - key: asset-dynamic-forms-hello-world-ui-modifications-install
       function: main
       events:
         - avi:forge:installed:app
+    - key: asset-writeback-on-create
+      function: writeback
+      events:
+        - avi:jira:created:issue
   scheduledTrigger:
     - key: asset-option-sync-schedule
       function: sync
@@ -28,17 +39,23 @@ modules:
       handler: sync.runSync
     - key: sync-web
       handler: sync.runSyncWeb
+    - key: writeback
+      handler: writeback.run
 resources:
   - key: uiModificationsMain
     path: static/hello-world/build
+  - key: adminPage
+    path: src/frontend/admin.jsx
 permissions:
   scopes:
+    - storage:app
     - manage:jira-configuration
     - read:jira-user
     - read:jira-work
     - write:jira-work
     - read:servicedesk-request
     - read:cmdb-object:jira
+    - write:cmdb-object:jira
     - read:cmdb-type:jira
     - read:cmdb-attribute:jira
     - read:cmdb-schema:jira
