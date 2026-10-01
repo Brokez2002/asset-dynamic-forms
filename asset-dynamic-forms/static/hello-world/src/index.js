@@ -1,14 +1,18 @@
 import { uiModificationsApi } from '@forge/jira-bridge';
 import { invoke } from '@forge/bridge';
 
-const SELECT_FIELD = 'customfield_11966';
+// Wert beginnt mit einem Asset-Key, z. B. "FOR-3286 – test 2"
+const KEY_PATTERN = /^([A-Z][A-Z0-9]*-\d+)/;
 
-// Asset-Attributname -> Jira-Feld (kommt später aus der Admin-Konfiguration)
-const MAPPING = [
-  { attribute: 'plan_opex',   field: 'customfield_11963', type: 'number' },
-  { attribute: 'plan_capex',  field: 'customfield_11964', type: 'number' },
-  { attribute: 'change_ziel', field: 'customfield_11965', type: 'adf' }
-];
+// Alle Felder des Formulars, wird in onInit befüllt
+let FORM_FIELDS = [];
+
+const norm = (s) =>
+  String(s || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]/g, '');
 
 const toAdf = (text) => ({
   version: 1,
@@ -21,29 +25,45 @@ const toAdf = (text) => ({
     : []
 });
 
-const convert = (value, type) => {
-  if (type === 'number') {
-    if (value === null || value === undefined || value === '') return null;
+// Wert anhand des Jira-Feldtyps konvertieren; undefined = Feldtyp nicht unterstützt
+const convert = (value, type = '') => {
+  const empty = value === null || value === undefined || value === '';
+  if (type.endsWith(':float') || type === 'number') {
+    if (empty) return null;
     const n = Number(value);
     return Number.isNaN(n) ? null : n;
   }
-  if (type === 'adf') return toAdf(value ?? '');
-  return value ?? '';
+  if (type.endsWith(':textarea') || type === 'description') return toAdf(empty ? '' : value);
+  if (type.endsWith(':textfield') || type === 'summary') return empty ? '' : String(value);
+  return undefined;
 };
 
-uiModificationsApi.onInit(() => {
-  console.log('[ADF] UIM geladen');
-}, () => []);
+uiModificationsApi.onInit(
+  ({ api }) => {
+    FORM_FIELDS = api.getFields().map((f) => ({
+      id: f.getId(),
+      name: f.getName?.(),
+      type: f.getType?.(),
+      norm: norm(f.getName?.())
+    }));
+    console.log('[ADF] Formularfelder:', JSON.stringify(FORM_FIELDS, null, 2));
+  },
+  () => []
+);
 
 uiModificationsApi.onChange(
   async ({ api, change }) => {
     const { current } = change;
-    if (!current || current.getId() !== SELECT_FIELD) return;
+    if (!current) return;
 
-    const objectKey = current.getValue()?.value?.split(' ')[0];
-    if (!objectKey) return;
+    const raw = current.getValue();
+    const text = typeof raw === 'object' && raw !== null ? raw.value : raw;
+    const match = typeof text === 'string' ? text.match(KEY_PATTERN) : null;
+    if (!match) return;
 
-        console.log('[ADF] Auswahl:', objectKey);
+    const objectKey = match[1];
+    console.log(`[ADF] Auslöser ${current.getId()} -> Asset ${objectKey}`);
+
     let result;
     try {
       result = await invoke('getAssetByKey', { objectKey });
@@ -51,19 +71,27 @@ uiModificationsApi.onChange(
       console.error('[ADF] invoke fehlgeschlagen:', e?.message || e);
       return;
     }
-    console.log('[ADF] Asset:', JSON.stringify(result, null, 2));
-    if (result.error) return;
+    if (result?.error) {
+      console.error('[ADF] Asset-Fehler:', JSON.stringify(result));
+      return;
+    }
 
-    console.log('[ADF] Vorhandene Attribute:', Object.keys(result.attributes || {}));
+    const attrMap = new Map(
+      Object.entries(result.attributes || {}).map(([name, value]) => [norm(name), value])
+    );
 
-    for (const m of MAPPING) {
-      const raw = result.attributes?.[m.attribute];
-      const value = convert(raw, m.type);
-      console.log(`[ADF] ${m.attribute} -> ${m.field}: roh=${JSON.stringify(raw)} gesetzt=${JSON.stringify(value)}`);
-      api.getFieldById(m.field)?.setValue(value);
+    for (const f of FORM_FIELDS) {
+      if (f.id === current.getId() || !attrMap.has(f.norm)) continue;
+      const value = convert(attrMap.get(f.norm), f.type);
+      if (value === undefined) {
+        console.log(`[ADF] Übersprungen (Typ nicht unterstützt): ${f.name} (${f.type})`);
+        continue;
+      }
+      console.log(`[ADF] ${f.name} <- ${JSON.stringify(attrMap.get(f.norm))}`);
+      api.getFieldById(f.id)?.setValue(value);
     }
   },
-  () => MAPPING.map((m) => m.field)
+  () => FORM_FIELDS.map((f) => f.id)
 );
 
 uiModificationsApi.onError(({ errors }) => {
