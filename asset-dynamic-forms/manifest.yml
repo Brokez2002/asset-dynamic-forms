@@ -1,0 +1,50 @@
+modules:
+  jira:uiModifications:
+    - key: asset-dynamic-forms-hello-world-ui-modifications
+      title: asset-dynamic-forms
+      resource: uiModificationsMain
+      resolver:
+        function: resolver
+      unlicensedAccess:
+        - customer
+  trigger:
+    - key: asset-dynamic-forms-hello-world-ui-modifications-install
+      function: main
+      events:
+        - avi:forge:installed:app
+  scheduledTrigger:
+    - key: asset-option-sync-schedule
+      function: sync
+      interval: fiveMinute
+  webtrigger:
+    - key: asset-option-sync-now
+      function: sync-web
+  function:
+    - key: main
+      handler: index.run
+    - key: resolver
+      handler: index.handler
+    - key: sync
+      handler: sync.runSync
+    - key: sync-web
+      handler: sync.runSyncWeb
+resources:
+  - key: uiModificationsMain
+    path: static/hello-world/build
+permissions:
+  scopes:
+    - manage:jira-configuration
+    - read:jira-user
+    - read:jira-work
+    - write:jira-work
+    - read:servicedesk-request
+    - read:cmdb-object:jira
+    - read:cmdb-type:jira
+    - read:cmdb-attribute:jira
+    - read:cmdb-schema:jira
+app:
+  runtime:
+    name: nodejs24.x
+    memoryMB: 256
+    architecture: arm64
+  id: ari:cloud:ecosystem::app/c0d257fd-69df-4a2f-9bc3-49fd90d88538
