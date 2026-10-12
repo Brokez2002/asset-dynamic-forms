@@ -16,17 +16,21 @@ content: line ? [{ type: 'text', text: line }] : []
 : []
 });
  
-// Wert anhand des Jira-Feldtyps konvertieren; undefined = Typ nicht unterstützt
-const convert = (value, type = '') => {
-const empty = value === null || value === undefined || value === '';
-if (type.endsWith(':float') || type === 'number') {
-if (empty) return null;
-const n = Number(value);
-return Number.isNaN(n) ? null : n;
-}
-if (type.endsWith(':textarea') || type === 'description') return toAdf(empty ? '' : value);
-if (type.endsWith(':textfield') || type === 'summary') return empty ? '' : String(value);
-return undefined;
+// Wert anhand von Feld-ID bzw. Feldtyp konvertieren; undefined = Typ nicht unterstützt
+const convert = (value, type = '', fieldId = '') => {
+  const empty = value === null || value === undefined || value === '';
+  if (fieldId === 'description' || type === 'description' || type.endsWith(':textarea')) {
+    return toAdf(empty ? '' : value);
+  }
+  if (fieldId === 'summary' || type === 'summary' || type.endsWith(':textfield')) {
+    return empty ? '' : String(value);
+  }
+  if (type.endsWith(':float') || type === 'number') {
+    if (empty) return null;
+    const n = Number(value);
+    return Number.isNaN(n) ? null : n;
+  }
+  return undefined;
 };
  
 // Konfiguration über die configId aus den UIM-Daten laden
@@ -84,15 +88,20 @@ return;
 }
  
 for (const m of cfg.mappings || []) {
-const attrValue = result.attributes ? result.attributes[m.attribute] : undefined;
-const value = convert(attrValue, m.fieldType);
-if (value === undefined) {
-console.log(`[ADF] Übersprungen (Typ nicht unterstützt): ${m.fieldName} (${m.fieldType})`);
-continue;
-}
-console.log(`[ADF] ${m.fieldName} <- ${JSON.stringify(attrValue)}`);
-const field = api.getFieldById(m.field);
-if (field) field.setValue(value);
+    const field = api.getFieldById(m.field);
+    if (!field) {
+    console.log(`[ADF] Übersprungen (Feld im Portal nicht verfügbar): ${m.fieldName}`);
+    continue;
+    }
+    const type = (field.getType && field.getType()) || m.fieldType;
+    const attrValue = result.attributes ? result.attributes[m.attribute] : undefined;
+    const value = convert(attrValue, type, m.field);
+    if (value === undefined) {
+    console.log(`[ADF] Übersprungen (Typ nicht unterstützt): ${m.fieldName} (${type})`);
+    continue;
+    }
+    console.log(`[ADF] ${m.fieldName} <- ${JSON.stringify(attrValue)}`);
+    field.setValue(value);
 }
 },
 () => (CONFIG ? (CONFIG.mappings || []).map((m) => m.field) : [])

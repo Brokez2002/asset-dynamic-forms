@@ -15,15 +15,30 @@ const norm = (s) =>
 
 const opt = (x) => ({ label: x.name, value: String(x.id) });
 
-const typeLabel = (t) => {
-  const s = String(t || '');
+// Effektiver Feldtyp: Systemfelder über ihre ID erkennen
+const effectiveType = (f) => {
+  if (f.id === 'summary') return 'summary';
+  if (f.id === 'description') return 'description';
+  return String(f.type || '');
+};
+
+const typeLabel = (f) => {
+  const s = effectiveType(f);
   if (s.endsWith(':float') || s === 'number') return 'Zahl';
   if (s.endsWith(':textarea')) return 'Mehrzeiliger Text';
   if (s.endsWith(':textfield')) return 'Text';
   if (s.endsWith(':select')) return 'Auswahlliste';
+  if (s.endsWith(':cmdb-object-cftype')) return 'Assets-Objekt';
   if (s === 'summary') return 'Zusammenfassung';
   if (s === 'description') return 'Beschreibung';
   return s.split(':').pop() || 'Unbekannt';
+};
+
+// Feldtypen, die die UIM im Portal befüllen kann
+const isSupported = (f) => {
+  const t = effectiveType(f);
+  return t === 'summary' || t === 'description' || t === 'number' ||
+    t.endsWith(':textfield') || t.endsWith(':textarea') || t.endsWith(':float');
 };
 
 // Mapping berechnen: manuelle Einträge behalten, sonst Namensabgleich
@@ -37,7 +52,7 @@ const computeMapping = (flds, attrs, prev) => {
       m[f.id] = p;
       return;
     }
-    const a = byNorm.get(norm(f.name));
+    const a = isSupported(f) ? byNorm.get(norm(f.name)) : null;
     m[f.id] = { attribute: a ? a.name : '', writeback: !!(a && a.editable), manual: false };
   });
   return m;
@@ -122,10 +137,10 @@ const App = () => {
   useEffect(() => {
     setLoading(true);
     Promise.all([invoke('getConfigs'), invoke('getServiceDesks'), invoke('getObjectSchemas')])
-      .then(([c, d, s]) => {
-        setConfigs(c || []);
-        setDesks(d || []);
-        setSchemas(s || []);
+      .then((res) => {
+        setConfigs(res[0] || []);
+        setDesks(res[1] || []);
+        setSchemas(res[2] || []);
       })
       .finally(() => setLoading(false));
   }, []);
@@ -186,11 +201,11 @@ const App = () => {
       setAttributes(at);
       setAqlFilter(cfg.aqlFilter || '');
 
-      // Gespeicherte Zuordnung übernehmen, alles andere bleibt "nicht gemappt"
+      // Gespeicherte Zuordnung übernehmen, alles andere bleibt "nicht zugeordnet"
       const prev = {};
       flds.forEach((f) => {
         const em = (cfg.mappings || []).find((x) => x.field === f.id);
-        prev[f.id] = em
+        prev[f.id] = em && isSupported(f)
           ? { attribute: em.attribute, writeback: !!em.writeback, manual: true }
           : { attribute: '', writeback: false, manual: true };
       });
@@ -254,8 +269,9 @@ const App = () => {
   // Speichern / Löschen / Sync
   // -------------------------------------------------------------------------
   const mappableFields = fields.filter((f) => !triggerField || f.id !== triggerField.value);
-  const mappedCount = mappableFields.filter((f) => mapping[f.id] && mapping[f.id].attribute).length;
-  const writebackCount = mappableFields.filter((f) => mapping[f.id] && mapping[f.id].attribute && mapping[f.id].writeback).length;
+  const isMapped = (f) => isSupported(f) && mapping[f.id] && mapping[f.id].attribute;
+  const mappedCount = mappableFields.filter(isMapped).length;
+  const writebackCount = mappableFields.filter((f) => isMapped(f) && mapping[f.id].writeback).length;
 
   const missing = [];
   if (!desk) missing.push('Service-Projekt');
@@ -269,11 +285,11 @@ const App = () => {
     try {
       const d = desks.find((x) => String(x.id) === desk.value);
       const mappings = mappableFields
-        .filter((f) => mapping[f.id] && mapping[f.id].attribute)
+        .filter(isMapped)
         .map((f) => ({
           field: f.id,
           fieldName: f.name,
-          fieldType: f.type,
+          fieldType: effectiveType(f),
           attribute: mapping[f.id].attribute,
           writeback: !!mapping[f.id].writeback
         }));
@@ -294,7 +310,11 @@ const App = () => {
         mappings
       });
       setConfigs(result || []);
-      setFlash({ appearance: 'success', title: 'Konfiguration gespeichert', text: `${mappings.length} Feld-Zuordnungen, davon ${mappings.filter((m) => m.writeback).length} mit Writeback.` });
+      setFlash({
+        appearance: 'success',
+        title: 'Konfiguration gespeichert',
+        text: `${mappings.length} Feld-Zuordnungen, davon ${mappings.filter((m) => m.writeback).length} mit Writeback.`
+      });
       resetEditor();
       setEditId(null);
       setView('list');
@@ -425,12 +445,14 @@ const App = () => {
   );
 
   const mappingRows = mappableFields.map((f) => {
+    const supported = isSupported(f);
     const row = mapping[f.id] || { attribute: '', writeback: false, manual: false };
     const attr = attributes.find((a) => a.name === row.attribute);
-    const canWrite = !!row.attribute && !!attr && attr.editable !== false;
+    const canWrite = supported && !!row.attribute && !!attr && attr.editable !== false;
 
     let status = <Lozenge>Nicht zugeordnet</Lozenge>;
-    if (row.attribute && !row.manual) status = <Lozenge appearance="success">Automatisch</Lozenge>;
+    if (!supported) status = <Lozenge appearance="removed">Nicht unterstützt</Lozenge>;
+    else if (row.attribute && !row.manual) status = <Lozenge appearance="success">Automatisch</Lozenge>;
     else if (row.attribute) status = <Lozenge appearance="inprogress">Manuell</Lozenge>;
 
     return {
@@ -445,13 +467,14 @@ const App = () => {
             </Stack>
           )
         },
-        { key: 'type', content: <Lozenge>{typeLabel(f.type)}</Lozenge> },
+        { key: 'type', content: <Lozenge>{typeLabel(f)}</Lozenge> },
         {
           key: 'attr',
           content: (
             <Select
               options={attrOptions}
-              value={attrOptions.find((o) => o.value === row.attribute)}
+              isDisabled={!supported}
+              value={supported ? attrOptions.find((o) => o.value === row.attribute) : attrOptions[0]}
               onChange={(v) => {
                 const val = v ? v.value : '';
                 const a = attributes.find((x) => x.name === val);
@@ -548,7 +571,7 @@ const App = () => {
       <Section
         step="4"
         title="Feld-Zuordnung"
-        description="Gleichnamige Felder und Attribute werden automatisch zugeordnet. Jede Zeile lässt sich manuell ändern."
+        description="Gleichnamige Felder und Attribute werden automatisch zugeordnet. Jede Zeile lässt sich manuell ändern. Assets-Objektfelder und andere nicht unterstützte Feldtypen sind ausgegraut."
         aside={
           mappingRows.length ? (
             <Inline space="space.100">

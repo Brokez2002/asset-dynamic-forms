@@ -144,7 +144,7 @@ if (!byId.has(f.fieldId)) {
 byId.set(f.fieldId, {
 id: f.fieldId,
 name: f.name,
-type: f.jiraSchema?.custom || f.jiraSchema?.type || ''
+type: f.jiraSchema?.custom || f.jiraSchema?.system || f.jiraSchema?.type || ''
 });
 }
 }
