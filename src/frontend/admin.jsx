@@ -5,46 +5,21 @@ import ForgeReconciler, {
   Spinner, EmptyState, xcss
 } from '@forge/react';
 import { invoke } from '@forge/bridge';
+import { norm, kindOf, fillModeOf, OPTION_KINDS, KIND_LABELS } from '../fieldKinds';
 
 // ---------------------------------------------------------------------------
-// Hilfsfunktionen
+// Helper functions
 // ---------------------------------------------------------------------------
-const norm = (s) =>
-  String(s || '').toLowerCase().normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]/g, '');
-
 const opt = (x) => ({ label: x.name, value: String(x.id) });
 
-// Effektiver Feldtyp: Systemfelder über ihre ID erkennen
-const effectiveType = (f) => {
-  if (f.id === 'summary') return 'summary';
-  if (f.id === 'description') return 'description';
-  return String(f.type || '');
-};
+const SELF = '__self__';
+const fieldKind = (f) => kindOf(f.id, f.type);
+const isSupported = (f) => fillModeOf(fieldKind(f)) !== null;
 
-const typeLabel = (f) => {
-  const s = effectiveType(f);
-  if (s.endsWith(':float') || s === 'number') return 'Zahl';
-  if (s.endsWith(':textarea')) return 'Mehrzeiliger Text';
-  if (s.endsWith(':textfield')) return 'Text';
-  if (s.endsWith(':select')) return 'Auswahlliste';
-  if (s.endsWith(':cmdb-object-cftype')) return 'Assets-Objekt';
-  if (s === 'summary') return 'Zusammenfassung';
-  if (s === 'description') return 'Beschreibung';
-  return s.split(':').pop() || 'Unbekannt';
-};
-
-// Feldtypen, die die UIM im Portal befüllen kann
-const isSupported = (f) => {
-  const t = effectiveType(f);
-  return t === 'summary' || t === 'description' || t === 'number' ||
-    t.endsWith(':textfield') || t.endsWith(':textarea') || t.endsWith(':float');
-};
-
-// Mapping berechnen: manuelle Einträge behalten, sonst Namensabgleich
+// Compute mapping: keep manual entries, otherwise match by name
 const computeMapping = (flds, attrs, prev) => {
   const byNorm = new Map(attrs.map((a) => [norm(a.name), a]));
-  const names = new Set(attrs.map((a) => a.name));
+  const names = new Set(attrs.map((a) => a.name).concat([SELF]));
   const m = {};
   flds.forEach((f) => {
     const p = prev ? prev[f.id] : null;
@@ -52,16 +27,28 @@ const computeMapping = (flds, attrs, prev) => {
       m[f.id] = p;
       return;
     }
+    const kind = fieldKind(f);
     const a = isSupported(f) ? byNorm.get(norm(f.name)) : null;
-    m[f.id] = { attribute: a ? a.name : '', writeback: !!(a && a.editable), manual: false };
+    m[f.id] = {
+      attribute: a ? a.name : '',
+      writeback: !!(a && a.editable) && kind !== 'assets',
+      manual: false
+    };
   });
   return m;
 };
 
+// Write-back timing options
+const MODE_OPTIONS = [
+  { label: 'On submit (when the request is created)', value: 'onCreate' },
+  { label: 'On status change (e.g. after approval)', value: 'onStatus' }
+];
+const modeOf = (c) => (c && c.writebackMode === 'onStatus' ? 'onStatus' : 'onCreate');
+
 // ---------------------------------------------------------------------------
 // Styles
 // ---------------------------------------------------------------------------
-const pageStyle = xcss({ maxWidth: '1120px', paddingBlock: 'space.200' });
+const pageStyle = xcss({ maxWidth: '1180px', paddingBlock: 'space.200' });
 
 const cardStyle = xcss({
   backgroundColor: 'elevation.surface.raised',
@@ -80,7 +67,7 @@ const footerStyle = xcss({
 });
 
 // ---------------------------------------------------------------------------
-// Bausteine
+// Building blocks
 // ---------------------------------------------------------------------------
 const Section = ({ step, title, description, aside, children }) => (
   <Box xcss={cardStyle}>
@@ -134,6 +121,10 @@ const App = () => {
 
   const [mapping, setMapping] = useState({});
 
+  const [writebackMode, setWritebackMode] = useState('onCreate');
+  const [statuses, setStatuses] = useState([]);
+  const [selectedStatuses, setSelectedStatuses] = useState([]);
+
   useEffect(() => {
     setLoading(true);
     Promise.all([invoke('getConfigs'), invoke('getServiceDesks'), invoke('getObjectSchemas')])
@@ -145,8 +136,19 @@ const App = () => {
       .finally(() => setLoading(false));
   }, []);
 
+  const loadStatuses = async (deskValue, rtIds) => {
+    if (!deskValue || !rtIds.length) return [];
+    const d = desks.find((x) => String(x.id) === String(deskValue));
+    if (!d || !d.projectId) return [];
+    return (await invoke('getWorkflowStatuses', {
+      serviceDeskId: deskValue,
+      projectId: d.projectId,
+      requestTypeIds: rtIds
+    })) || [];
+  };
+
   // -------------------------------------------------------------------------
-  // Editor zurücksetzen / öffnen
+  // Reset / open editor
   // -------------------------------------------------------------------------
   const resetEditor = () => {
     setDesk(null);
@@ -160,6 +162,9 @@ const App = () => {
     setAttributes([]);
     setAqlFilter('');
     setMapping({});
+    setWritebackMode('onCreate');
+    setStatuses([]);
+    setSelectedStatuses([]);
   };
 
   const startNew = () => {
@@ -177,7 +182,7 @@ const App = () => {
     setLoading(true);
     try {
       const d = desks.find((x) => String(x.id) === String(cfg.serviceDeskId));
-      const deskOpt = d ? opt(d) : { label: `Service Desk ${cfg.serviceDeskId}`, value: String(cfg.serviceDeskId) };
+      const deskOpt = d ? opt(d) : { label: `Service desk ${cfg.serviceDeskId}`, value: String(cfg.serviceDeskId) };
       setDesk(deskOpt);
 
       const rts = (await invoke('getRequestTypes', { serviceDeskId: deskOpt.value })) || [];
@@ -201,7 +206,7 @@ const App = () => {
       setAttributes(at);
       setAqlFilter(cfg.aqlFilter || '');
 
-      // Gespeicherte Zuordnung übernehmen, alles andere bleibt "nicht zugeordnet"
+      // Apply saved mapping, everything else stays "not mapped"
       const prev = {};
       flds.forEach((f) => {
         const em = (cfg.mappings || []).find((x) => x.field === f.id);
@@ -210,6 +215,12 @@ const App = () => {
           : { attribute: '', writeback: false, manual: true };
       });
       setMapping(prev);
+
+      setWritebackMode(modeOf(cfg));
+      const sts = await loadStatuses(deskOpt.value, rtIds);
+      setStatuses(sts);
+      const savedIds = (cfg.writebackStatusIds || []).map(String);
+      setSelectedStatuses(sts.filter((s) => savedIds.includes(String(s.id))).map(opt));
     } finally {
       setLoading(false);
     }
@@ -222,7 +233,7 @@ const App = () => {
   };
 
   // -------------------------------------------------------------------------
-  // Auswahl-Handler
+  // Selection handlers
   // -------------------------------------------------------------------------
   const onDesk = async (v) => {
     setDesk(v);
@@ -230,18 +241,26 @@ const App = () => {
     setFields([]);
     setTriggerField(null);
     setMapping({});
+    setStatuses([]);
+    setSelectedStatuses([]);
     setRequestTypes(v ? (await invoke('getRequestTypes', { serviceDeskId: v.value })) || [] : []);
   };
 
   const onRts = async (v) => {
     const list = v || [];
     setSelectedRts(list);
+    const rtIds = list.map((r) => r.value);
     const flds = list.length
-      ? (await invoke('getRequestTypeFields', { serviceDeskId: desk.value, requestTypeIds: list.map((r) => r.value) })) || []
+      ? (await invoke('getRequestTypeFields', { serviceDeskId: desk.value, requestTypeIds: rtIds })) || []
       : [];
     setFields(flds);
     if (triggerField && !flds.find((f) => f.id === triggerField.value)) setTriggerField(null);
     setMapping(computeMapping(flds, attributes, mapping));
+
+    const sts = await loadStatuses(desk.value, rtIds);
+    setStatuses(sts);
+    const ids = new Set(sts.map((s) => String(s.id)));
+    setSelectedStatuses((prev) => prev.filter((s) => ids.has(s.value)));
   };
 
   const onSchema = async (v) => {
@@ -266,7 +285,7 @@ const App = () => {
     });
 
   // -------------------------------------------------------------------------
-  // Speichern / Löschen / Sync
+  // Save / delete / sync
   // -------------------------------------------------------------------------
   const mappableFields = fields.filter((f) => !triggerField || f.id !== triggerField.value);
   const isMapped = (f) => isSupported(f) && mapping[f.id] && mapping[f.id].attribute;
@@ -274,10 +293,11 @@ const App = () => {
   const writebackCount = mappableFields.filter((f) => isMapped(f) && mapping[f.id].writeback).length;
 
   const missing = [];
-  if (!desk) missing.push('Service-Projekt');
-  if (!selectedRts.length) missing.push('Request Type');
-  if (!schema || !objectType) missing.push('Objekttyp');
-  if (!triggerField) missing.push('Auslöserfeld');
+  if (!desk) missing.push('Service project');
+  if (!selectedRts.length) missing.push('Request type');
+  if (!schema || !objectType) missing.push('Object type');
+  if (!triggerField) missing.push('Trigger field');
+  if (writebackCount && writebackMode === 'onStatus' && !selectedStatuses.length) missing.push('Target status');
   const canSave = !missing.length && !busy;
 
   const save = async () => {
@@ -286,14 +306,21 @@ const App = () => {
       const d = desks.find((x) => String(x.id) === desk.value);
       const mappings = mappableFields
         .filter(isMapped)
-        .map((f) => ({
-          field: f.id,
-          fieldName: f.name,
-          fieldType: effectiveType(f),
-          attribute: mapping[f.id].attribute,
-          writeback: !!mapping[f.id].writeback
-        }));
+        .map((f) => {
+          const kind = fieldKind(f);
+          return {
+            field: f.id,
+            fieldName: f.name,
+            fieldType: f.type,
+            kind,
+            mode: fillModeOf(kind),
+            attribute: mapping[f.id].attribute,
+            writeback: kind !== 'assets' && mapping[f.id].attribute !== SELF && !!mapping[f.id].writeback,
+            options: OPTION_KINDS.includes(kind) ? f.options || [] : []
+          };
+        });
 
+      const onStatus = writebackMode === 'onStatus';
       const result = await invoke('saveConfig', {
         id: editId || undefined,
         serviceDeskId: desk.value,
@@ -307,19 +334,25 @@ const App = () => {
         objectTypeId: objectType.value,
         objectTypeName: objectType.label,
         aqlFilter,
-        mappings
+        mappings,
+        writebackMode,
+        writebackStatusIds: onStatus ? selectedStatuses.map((s) => s.value) : [],
+        writebackStatusNames: onStatus ? selectedStatuses.map((s) => s.label) : []
       });
       setConfigs(result || []);
+      const wbCount = mappings.filter((m) => m.writeback).length;
+      const after = mappings.filter((m) => m.mode === 'afterSubmit').length;
+      const timing = onStatus ? `on status ${selectedStatuses.map((s) => s.label).join(', ')}` : 'on submit';
       setFlash({
         appearance: 'success',
-        title: 'Konfiguration gespeichert',
-        text: `${mappings.length} Feld-Zuordnungen, davon ${mappings.filter((m) => m.writeback).length} mit Writeback.`
+        title: 'Configuration saved',
+        text: `${mappings.length} field mapping${mappings.length === 1 ? '' : 's'} (${after} set after submit), ${wbCount} with write-back (${timing}).`
       });
       resetEditor();
       setEditId(null);
       setView('list');
     } catch (e) {
-      setFlash({ appearance: 'error', title: 'Speichern fehlgeschlagen', text: String(e && e.message ? e.message : e) });
+      setFlash({ appearance: 'error', title: 'Saving failed', text: String(e && e.message ? e.message : e) });
     } finally {
       setBusy(false);
     }
@@ -329,7 +362,7 @@ const App = () => {
     setBusy(true);
     try {
       setConfigs((await invoke('deleteConfig', { id })) || []);
-      setFlash({ appearance: 'information', title: 'Konfiguration gelöscht', text: 'Die zugehörigen Portal-Kontexte wurden entfernt.' });
+      setFlash({ appearance: 'information', title: 'Configuration deleted', text: 'The related portal contexts have been removed.' });
     } finally {
       setBusy(false);
     }
@@ -344,22 +377,28 @@ const App = () => {
       const created = res.reduce((s, r) => s + (r.created || 0), 0);
       const updated = res.reduce((s, r) => s + (r.updated || 0), 0);
       setFlash(errors.length
-        ? { appearance: 'error', title: 'Synchronisierung mit Fehlern', text: errors.map((e) => `${e.config}: ${e.error}`).join(' | ') }
-        : { appearance: 'success', title: 'Auswahllisten synchronisiert', text: `${assets} Assets geprüft, ${created} Optionen neu, ${updated} aktualisiert.` });
+        ? { appearance: 'error', title: 'Sync completed with errors', text: errors.map((e) => `${e.config}: ${e.error}`).join(' | ') }
+        : { appearance: 'success', title: 'Select lists synced', text: `${assets} assets checked, ${created} options created, ${updated} updated.` });
     } catch (e) {
-      setFlash({ appearance: 'error', title: 'Synchronisierung fehlgeschlagen', text: String(e && e.message ? e.message : e) });
+      setFlash({ appearance: 'error', title: 'Sync failed', text: String(e && e.message ? e.message : e) });
     } finally {
       setBusy(false);
     }
   };
 
   // -------------------------------------------------------------------------
-  // Ansicht: Übersicht
+  // View: overview
   // -------------------------------------------------------------------------
   const deskName = (c) => {
     if (c.serviceDeskName) return c.serviceDeskName;
     const d = desks.find((x) => String(x.id) === String(c.serviceDeskId));
-    return d ? d.name : `Service Desk ${c.serviceDeskId || '-'}`;
+    return d ? d.name : `Service desk ${c.serviceDeskId || '-'}`;
+  };
+
+  const timingLabel = (c) => {
+    if (modeOf(c) !== 'onStatus') return 'On submit';
+    const names = c.writebackStatusNames || c.writebackStatusIds || [];
+    return names.length ? `On status: ${names.join(', ')}` : 'On status (none selected)';
   };
 
   const listRows = configs.map((c) => {
@@ -374,7 +413,7 @@ const App = () => {
           content: (
             <Stack space="space.050">
               <Strong>{deskName(c)}</Strong>
-              {!complete && <Lozenge appearance="moved">Unvollständig</Lozenge>}
+              {!complete && <Lozenge appearance="moved">Incomplete</Lozenge>}
             </Stack>
           )
         },
@@ -384,7 +423,7 @@ const App = () => {
           content: (
             <Stack space="space.050">
               <Text>{c.objectTypeName || '-'}</Text>
-              {c.aqlFilter ? <Lozenge appearance="new">AQL-Filter</Lozenge> : null}
+              {c.aqlFilter ? <Lozenge appearance="new">AQL filter</Lozenge> : null}
             </Stack>
           )
         },
@@ -392,18 +431,21 @@ const App = () => {
         {
           key: 'maps',
           content: (
-            <Inline space="space.100" alignBlock="center">
-              <Badge>{maps.length}</Badge>
-              {wb ? <Lozenge appearance="success">{`${wb} Writeback`}</Lozenge> : <Lozenge>Nur lesen</Lozenge>}
-            </Inline>
+            <Stack space="space.050">
+              <Inline space="space.100" alignBlock="center">
+                <Badge>{maps.length}</Badge>
+                {wb ? <Lozenge appearance="success">{`${wb} write-back`}</Lozenge> : <Lozenge>Read only</Lozenge>}
+              </Inline>
+              {wb ? <Text>{timingLabel(c)}</Text> : null}
+            </Stack>
           )
         },
         {
           key: 'actions',
           content: (
             <ButtonGroup>
-              <Button appearance="subtle" onClick={() => startEdit(c)} isDisabled={busy}>Bearbeiten</Button>
-              <Button appearance="subtle" onClick={() => remove(c.id)} isDisabled={busy}>Löschen</Button>
+              <Button appearance="subtle" onClick={() => startEdit(c)} isDisabled={busy}>Edit</Button>
+              <Button appearance="subtle" onClick={() => remove(c.id)} isDisabled={busy}>Delete</Button>
             </ButtonGroup>
           )
         }
@@ -417,11 +459,11 @@ const App = () => {
         <DynamicTable
           head={{
             cells: [
-              { key: 'desk', content: 'Service-Projekt' },
-              { key: 'rts', content: 'Request Types' },
-              { key: 'source', content: 'Asset-Quelle' },
-              { key: 'trigger', content: 'Auslöserfeld' },
-              { key: 'maps', content: 'Zuordnungen' },
+              { key: 'desk', content: 'Service project' },
+              { key: 'rts', content: 'Request types' },
+              { key: 'source', content: 'Asset source' },
+              { key: 'trigger', content: 'Trigger field' },
+              { key: 'maps', content: 'Mappings' },
               { key: 'actions', content: '' }
             ]
           }}
@@ -429,31 +471,45 @@ const App = () => {
         />
       ) : (
         <EmptyState
-          header="Noch keine Konfiguration"
-          description="Lege fest, in welchen Portalformularen Werte aus Assets geladen und zurückgeschrieben werden."
-          primaryAction={<Button appearance="primary" onClick={startNew}>Konfiguration anlegen</Button>}
+          header="No configurations yet"
+          description="Define which portal forms load values from Assets and write changes back."
+          primaryAction={<Button appearance="primary" onClick={startNew}>Create configuration</Button>}
         />
       )}
     </Box>
   );
 
   // -------------------------------------------------------------------------
-  // Ansicht: Editor
+  // View: editor
   // -------------------------------------------------------------------------
-  const attrOptions = [{ label: '– nicht zugeordnet –', value: '' }].concat(
-    attributes.map((a) => ({ label: a.editable ? a.name : `${a.name} (schreibgeschützt)`, value: a.name }))
+  const baseAttrOptions = [{ label: '– Not mapped –', value: '' }].concat(
+    attributes.map((a) => ({ label: a.editable ? a.name : `${a.name} (read-only)`, value: a.name }))
   );
 
+  // Assets object fields: the selected asset itself or a reference attribute
+  const assetsAttrOptions = () => {
+    const refs = attributes.filter((a) => a.isReference);
+    return [
+      { label: '– Not mapped –', value: '' },
+      { label: '(Selected asset)', value: SELF }
+    ].concat((refs.length ? refs : attributes).map((a) => ({ label: a.name, value: a.name })));
+  };
+
   const mappingRows = mappableFields.map((f) => {
-    const supported = isSupported(f);
+    const kind = fieldKind(f);
+    const mode = fillModeOf(kind);
+    const supported = mode !== null;
     const row = mapping[f.id] || { attribute: '', writeback: false, manual: false };
     const attr = attributes.find((a) => a.name === row.attribute);
-    const canWrite = supported && !!row.attribute && !!attr && attr.editable !== false;
+    const canWrite =
+      supported && kind !== 'assets' && row.attribute !== SELF &&
+      !!row.attribute && !!attr && attr.editable !== false;
+    const options = kind === 'assets' ? assetsAttrOptions() : baseAttrOptions;
 
-    let status = <Lozenge>Nicht zugeordnet</Lozenge>;
-    if (!supported) status = <Lozenge appearance="removed">Nicht unterstützt</Lozenge>;
-    else if (row.attribute && !row.manual) status = <Lozenge appearance="success">Automatisch</Lozenge>;
-    else if (row.attribute) status = <Lozenge appearance="inprogress">Manuell</Lozenge>;
+    let status = <Lozenge>Not mapped</Lozenge>;
+    if (!supported) status = <Lozenge appearance="removed">Not supported</Lozenge>;
+    else if (row.attribute && !row.manual) status = <Lozenge appearance="success">Automatic</Lozenge>;
+    else if (row.attribute) status = <Lozenge appearance="inprogress">Manual</Lozenge>;
 
     return {
       key: f.id,
@@ -467,18 +523,26 @@ const App = () => {
             </Stack>
           )
         },
-        { key: 'type', content: <Lozenge>{typeLabel(f)}</Lozenge> },
+        { key: 'type', content: <Lozenge>{KIND_LABELS[kind] || kind}</Lozenge> },
+        {
+          key: 'fill',
+          content: !supported
+            ? <Text>-</Text>
+            : mode === 'live'
+              ? <Lozenge appearance="success">Live</Lozenge>
+              : <Lozenge appearance="moved">After submit</Lozenge>
+        },
         {
           key: 'attr',
           content: (
             <Select
-              options={attrOptions}
+              options={options}
               isDisabled={!supported}
-              value={supported ? attrOptions.find((o) => o.value === row.attribute) : attrOptions[0]}
+              value={supported ? options.find((o) => o.value === row.attribute) : options[0]}
               onChange={(v) => {
                 const val = v ? v.value : '';
                 const a = attributes.find((x) => x.name === val);
-                setRow(f.id, { attribute: val, writeback: !!(a && a.editable) });
+                setRow(f.id, { attribute: val, writeback: kind !== 'assets' && !!(a && a.editable) });
               }}
             />
           )
@@ -501,82 +565,70 @@ const App = () => {
 
   const renderEditor = () => (
     <Stack space="space.300">
-      <Section
-        step="1"
-        title="Portal und Request Types"
-        description="In welchen Portalformularen soll die App aktiv sein?"
-      >
+      <Section step="1" title="Portal and request types" description="Which portal forms should the app be active on?">
         <Inline space="space.300" shouldWrap>
           <Box xcss={xcss({ width: '320px' })}>
-            <Field id="desk" label="Service-Projekt">
-              <Select id="desk" options={desks.map(opt)} value={desk} onChange={onDesk} placeholder="Projekt wählen" />
+            <Field id="desk" label="Service project">
+              <Select id="desk" options={desks.map(opt)} value={desk} onChange={onDesk} placeholder="Select a project" />
             </Field>
           </Box>
           <Box xcss={xcss({ width: '480px' })}>
-            <Field id="rts" label="Request Types" helper="Mehrfachauswahl möglich. Die Felder aller gewählten Request Types werden zusammengeführt.">
-              <Select id="rts" isMulti isDisabled={!desk} options={requestTypes.map(opt)} value={selectedRts} onChange={onRts} placeholder="Request Types wählen" />
+            <Field id="rts" label="Request types" helper="You can select multiple. Fields from all selected request types are combined.">
+              <Select id="rts" isMulti isDisabled={!desk} options={requestTypes.map(opt)} value={selectedRts} onChange={onRts} placeholder="Select request types" />
             </Field>
           </Box>
         </Inline>
       </Section>
 
-      <Section
-        step="2"
-        title="Asset-Quelle"
-        description="Aus welchem Objekttyp in Assets kommen die Werte?"
-      >
+      <Section step="2" title="Asset source" description="Which object type in Assets do the values come from?">
         <Inline space="space.300" shouldWrap>
           <Box xcss={xcss({ width: '320px' })}>
-            <Field id="schema" label="Objektschema">
-              <Select id="schema" options={schemas.map(opt)} value={schema} onChange={onSchema} placeholder="Schema wählen" />
+            <Field id="schema" label="Object schema">
+              <Select id="schema" options={schemas.map(opt)} value={schema} onChange={onSchema} placeholder="Select a schema" />
             </Field>
           </Box>
           <Box xcss={xcss({ width: '320px' })}>
-            <Field id="type" label="Objekttyp">
-              <Select id="type" isDisabled={!schema} options={types.map(opt)} value={objectType} onChange={onType} placeholder="Objekttyp wählen" />
+            <Field id="type" label="Object type">
+              <Select id="type" isDisabled={!schema} options={types.map(opt)} value={objectType} onChange={onType} placeholder="Select an object type" />
             </Field>
           </Box>
         </Inline>
         <Box xcss={xcss({ maxWidth: '660px' })}>
-          <Field id="aql" label="Zusätzlicher AQL-Filter (optional)" helper="Schränkt ein, welche Objekte im Portal auswählbar sind.">
-            <Textfield id="aql" value={aqlFilter} placeholder='z. B. Status = "Freigegeben"' onChange={(e) => setAqlFilter(e.target.value)} />
+          <Field id="aql" label="Additional AQL filter (optional)" helper="Limits which objects can be selected in the portal.">
+            <Textfield id="aql" value={aqlFilter} placeholder='e.g. Status = "Approved"' onChange={(e) => setAqlFilter(e.target.value)} />
           </Field>
         </Box>
       </Section>
 
-      <Section
-        step="3"
-        title="Auslöserfeld"
-        description="Die Auswahlliste, über die Kunden das Asset wählen. Die Optionen pflegt die App automatisch."
-      >
+      <Section step="3" title="Trigger field" description="The select list customers use to choose the asset. The app keeps its options up to date automatically.">
         <Box xcss={xcss({ width: '320px' })}>
-          <Field id="trigger" label="Auswahlliste">
+          <Field id="trigger" label="Select list">
             <Select
               id="trigger"
               isDisabled={!fields.length}
-              options={fields.filter((f) => String(f.type).endsWith(':select')).map(opt)}
+              options={fields.filter((f) => fieldKind(f) === 'select').map(opt)}
               value={triggerField}
               onChange={setTriggerField}
-              placeholder="Feld wählen"
+              placeholder="Select a field"
             />
           </Field>
         </Box>
-        {fields.length > 0 && !fields.some((f) => String(f.type).endsWith(':select')) && (
-          <SectionMessage appearance="warning" title="Keine Auswahlliste im Formular">
-            <Text>Nimm eine Einzelauswahlliste in das Anfrageformular auf, damit Kunden ein Asset wählen können.</Text>
+        {fields.length > 0 && !fields.some((f) => fieldKind(f) === 'select') && (
+          <SectionMessage appearance="warning" title="No select list in the form">
+            <Text>Add a single-select list to the request form so customers can choose an asset.</Text>
           </SectionMessage>
         )}
       </Section>
 
       <Section
         step="4"
-        title="Feld-Zuordnung"
-        description="Gleichnamige Felder und Attribute werden automatisch zugeordnet. Jede Zeile lässt sich manuell ändern. Assets-Objektfelder und andere nicht unterstützte Feldtypen sind ausgegraut."
+        title="Field mapping"
+        description="Fields and attributes with matching names are mapped automatically. Live fields are filled in the portal as soon as an asset is selected. After-submit fields cannot be changed in the portal by apps and are set on the request right after it is created, if the customer left them empty."
         aside={
           mappingRows.length ? (
             <Inline space="space.100">
-              <Lozenge appearance="success">{`${mappedCount} zugeordnet`}</Lozenge>
-              <Lozenge appearance="inprogress">{`${writebackCount} Writeback`}</Lozenge>
+              <Lozenge appearance="success">{`${mappedCount} mapped`}</Lozenge>
+              <Lozenge appearance="inprogress">{`${writebackCount} write-back`}</Lozenge>
             </Inline>
           ) : null
         }
@@ -585,10 +637,11 @@ const App = () => {
           <DynamicTable
             head={{
               cells: [
-                { key: 'field', content: 'Formularfeld' },
-                { key: 'type', content: 'Feldtyp' },
-                { key: 'attr', content: 'Asset-Attribut' },
-                { key: 'wb', content: 'Zurückschreiben' },
+                { key: 'field', content: 'Form field' },
+                { key: 'type', content: 'Field type' },
+                { key: 'fill', content: 'Filled' },
+                { key: 'attr', content: 'Asset attribute' },
+                { key: 'wb', content: 'Write back' },
                 { key: 'status', content: 'Status' }
               ]
             }}
@@ -596,18 +649,61 @@ const App = () => {
           />
         ) : (
           <SectionMessage appearance="information">
-            <Text>Wähle Request Types und einen Objekttyp, um die Zuordnung zu sehen.</Text>
+            <Text>Select request types and an object type to see the mapping.</Text>
+          </SectionMessage>
+        )}
+        <SectionMessage appearance="information">
+          <Text>Select lists: the asset value must match the option name. Cascading select: use "Parent &gt; Child" in Assets. Assets object fields: choose "(Selected asset)" or a reference attribute.</Text>
+        </SectionMessage>
+      </Section>
+
+      <Section step="5" title="Write-back timing" description="When should changed values be written back to the asset? Use a status change to wait for approvals first.">
+        {writebackCount ? (
+          <Stack space="space.200">
+            <Box xcss={xcss({ width: '420px' })}>
+              <Field id="wbmode" label="Write back">
+                <Select
+                  id="wbmode"
+                  options={MODE_OPTIONS}
+                  value={MODE_OPTIONS.find((o) => o.value === writebackMode)}
+                  onChange={(v) => setWritebackMode(v ? v.value : 'onCreate')}
+                />
+              </Field>
+            </Box>
+            {writebackMode === 'onStatus' && (
+              <Box xcss={xcss({ width: '480px' })}>
+                <Field
+                  id="wbstatus"
+                  label="Target status"
+                  helper="Write-back runs once when the request moves into one of these statuses. Choose the status after approval so rejected requests are not written back."
+                >
+                  <Select
+                    id="wbstatus"
+                    isMulti
+                    isDisabled={!statuses.length}
+                    options={statuses.map(opt)}
+                    value={selectedStatuses}
+                    onChange={(v) => setSelectedStatuses(v || [])}
+                    placeholder={statuses.length ? 'Select statuses' : 'Select request types first'}
+                  />
+                </Field>
+              </Box>
+            )}
+          </Stack>
+        ) : (
+          <SectionMessage appearance="information">
+            <Text>No field has write-back enabled. Turn on "Write back" for at least one field in step 4.</Text>
           </SectionMessage>
         )}
       </Section>
 
       <Box xcss={footerStyle}>
         <Inline spread="space-between" alignBlock="center">
-          <Text>{missing.length ? `Noch offen: ${missing.join(', ')}` : 'Alle Pflichtangaben vollständig.'}</Text>
+          <Text>{missing.length ? `Still missing: ${missing.join(', ')}` : 'All required settings are complete.'}</Text>
           <ButtonGroup>
-            <Button appearance="subtle" onClick={cancel} isDisabled={busy}>Abbrechen</Button>
+            <Button appearance="subtle" onClick={cancel} isDisabled={busy}>Cancel</Button>
             <Button appearance="primary" onClick={save} isDisabled={!canSave}>
-              {editId ? 'Änderungen speichern' : 'Konfiguration speichern'}
+              {editId ? 'Save changes' : 'Save configuration'}
             </Button>
           </ButtonGroup>
         </Inline>
@@ -623,13 +719,13 @@ const App = () => {
       <Stack space="space.300">
         <Inline spread="space-between" alignBlock="center">
           <Stack space="space.050">
-            <Heading as="h2">{view === 'edit' ? (editId ? 'Konfiguration bearbeiten' : 'Neue Konfiguration') : 'Asset Dynamic Forms'}</Heading>
-            <Text>Befüllt Portalformulare mit Werten aus Assets und schreibt Änderungen zurück.</Text>
+            <Heading as="h2">{view === 'edit' ? (editId ? 'Edit configuration' : 'New configuration') : 'Asset Dynamic Forms'}</Heading>
+            <Text>Fills portal forms with values from Assets and writes changes back.</Text>
           </Stack>
           {view === 'list' && (
             <ButtonGroup>
-              <Button onClick={syncNow} isDisabled={busy || !configs.length}>Auswahllisten jetzt synchronisieren</Button>
-              <Button appearance="primary" onClick={startNew} isDisabled={busy}>Neue Konfiguration</Button>
+              <Button onClick={syncNow} isDisabled={busy || !configs.length}>Sync select lists now</Button>
+              <Button appearance="primary" onClick={startNew} isDisabled={busy}>New configuration</Button>
             </ButtonGroup>
           )}
         </Inline>

@@ -20,9 +20,15 @@ modules:
       events:
         - avi:forge:installed:app
     - key: asset-writeback-on-create
-      function: writeback
+      function: writeback-create
       events:
         - avi:jira:created:issue
+    - key: asset-writeback-on-update
+      function: writeback-update
+      events:
+        - avi:jira:updated:issue
+      filter:
+        ignoreSelf: true
   scheduledTrigger:
     - key: asset-option-sync-schedule
       function: sync
@@ -39,8 +45,10 @@ modules:
       handler: sync.runSync
     - key: sync-web
       handler: sync.runSyncWeb
-    - key: writeback
-      handler: writeback.run
+    - key: writeback-create
+      handler: writeback.onCreate
+    - key: writeback-update
+      handler: writeback.onUpdate
 resources:
   - key: uiModificationsMain
     path: static/hello-world/build
