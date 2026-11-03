@@ -13,8 +13,12 @@ import { norm, kindOf, fillModeOf, OPTION_KINDS, KIND_LABELS } from '../fieldKin
 const opt = (x) => ({ label: x.name, value: String(x.id) });
 
 const SELF = '__self__';
+const LIST_KINDS = ['select', 'multiselect'];
 const fieldKind = (f) => kindOf(f.id, f.type);
 const isSupported = (f) => fillModeOf(fieldKind(f)) !== null;
+
+// Select list mapped to a reference attribute -> options are synced from the referenced object type
+const isRefList = (kind, attr) => LIST_KINDS.includes(kind) && !!attr && !!attr.isReference;
 
 // Compute mapping: keep manual entries, otherwise match by name
 const computeMapping = (flds, attrs, prev) => {
@@ -32,6 +36,7 @@ const computeMapping = (flds, attrs, prev) => {
     m[f.id] = {
       attribute: a ? a.name : '',
       writeback: !!(a && a.editable) && kind !== 'assets',
+      refAqlFilter: '',
       manual: false
     };
   });
@@ -44,6 +49,22 @@ const MODE_OPTIONS = [
   { label: 'On status change (e.g. after approval)', value: 'onStatus' }
 ];
 const modeOf = (c) => (c && c.writebackMode === 'onStatus' ? 'onStatus' : 'onCreate');
+
+// Text for the last background sync
+const syncStatusText = (s) => {
+  if (!s) return 'No sync has run yet.';
+  if (s.running) return `Sync (${s.mode || 'delta'}) running since ${new Date(s.startedAt).toLocaleString()}…`;
+  if (s.error) return `Last sync ${new Date(s.at).toLocaleString()} failed: ${s.error}`;
+  const res = s.results || [];
+  const errors = res.filter((r) => r.error);
+  const assets = res.reduce((n, r) => n + (r.assets || 0), 0);
+  const created = res.reduce((n, r) => n + (r.created || 0), 0);
+  const updated = res.reduce((n, r) => n + (r.updated || 0), 0);
+  const disabled = res.reduce((n, r) => n + (r.disabled || 0), 0);
+  let t = `Last sync (${s.mode || 'delta'}) ${new Date(s.at).toLocaleString()}: ${res.length} list${res.length === 1 ? '' : 's'}, ${assets} assets checked, ${created} created, ${updated} updated, ${disabled} disabled.`;
+  if (errors.length) t += ` Errors: ${errors.map((e) => `${e.field}: ${e.error}`).join(' | ')}`;
+  return t;
+};
 
 // ---------------------------------------------------------------------------
 // Styles
@@ -102,6 +123,7 @@ const App = () => {
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [flash, setFlash] = useState(null);
+  const [syncStatus, setSyncStatus] = useState(null);
 
   const [configs, setConfigs] = useState([]);
   const [desks, setDesks] = useState([]);
@@ -125,13 +147,16 @@ const App = () => {
   const [statuses, setStatuses] = useState([]);
   const [selectedStatuses, setSelectedStatuses] = useState([]);
 
+  const loadSyncStatus = async () => setSyncStatus((await invoke('getSyncStatus')) || null);
+
   useEffect(() => {
     setLoading(true);
-    Promise.all([invoke('getConfigs'), invoke('getServiceDesks'), invoke('getObjectSchemas')])
+    Promise.all([invoke('getConfigs'), invoke('getServiceDesks'), invoke('getObjectSchemas'), invoke('getSyncStatus')])
       .then((res) => {
         setConfigs(res[0] || []);
         setDesks(res[1] || []);
         setSchemas(res[2] || []);
+        setSyncStatus(res[3] || null);
       })
       .finally(() => setLoading(false));
   }, []);
@@ -211,8 +236,8 @@ const App = () => {
       flds.forEach((f) => {
         const em = (cfg.mappings || []).find((x) => x.field === f.id);
         prev[f.id] = em && isSupported(f)
-          ? { attribute: em.attribute, writeback: !!em.writeback, manual: true }
-          : { attribute: '', writeback: false, manual: true };
+          ? { attribute: em.attribute, writeback: !!em.writeback, refAqlFilter: em.refAqlFilter || '', manual: true }
+          : { attribute: '', writeback: false, refAqlFilter: '', manual: true };
       });
       setMapping(prev);
 
@@ -291,6 +316,13 @@ const App = () => {
   const isMapped = (f) => isSupported(f) && mapping[f.id] && mapping[f.id].attribute;
   const mappedCount = mappableFields.filter(isMapped).length;
   const writebackCount = mappableFields.filter((f) => isMapped(f) && mapping[f.id].writeback).length;
+  const attrByName = (name) => attributes.find((a) => a.name === name);
+
+  const refWithoutType = mappableFields.filter((f) => {
+    if (!isMapped(f)) return false;
+    const a = attrByName(mapping[f.id].attribute);
+    return isRefList(fieldKind(f), a) && !a.refObjectTypeId;
+  });
 
   const missing = [];
   if (!desk) missing.push('Service project');
@@ -308,6 +340,8 @@ const App = () => {
         .filter(isMapped)
         .map((f) => {
           const kind = fieldKind(f);
+          const a = attrByName(mapping[f.id].attribute);
+          const ref = isRefList(kind, a);
           return {
             field: f.id,
             fieldName: f.name,
@@ -316,7 +350,9 @@ const App = () => {
             mode: fillModeOf(kind),
             attribute: mapping[f.id].attribute,
             writeback: kind !== 'assets' && mapping[f.id].attribute !== SELF && !!mapping[f.id].writeback,
-            options: OPTION_KINDS.includes(kind) ? f.options || [] : []
+            refObjectTypeId: ref ? a.refObjectTypeId || null : null,
+            refAqlFilter: ref ? String(mapping[f.id].refAqlFilter || '').trim() : '',
+            options: !ref && OPTION_KINDS.includes(kind) ? f.options || [] : []
           };
         });
 
@@ -340,13 +376,17 @@ const App = () => {
         writebackStatusNames: onStatus ? selectedStatuses.map((s) => s.label) : []
       });
       setConfigs(result || []);
+
+      await invoke('runSyncNow');
+      await loadSyncStatus();
+
       const wbCount = mappings.filter((m) => m.writeback).length;
       const after = mappings.filter((m) => m.mode === 'afterSubmit').length;
       const timing = onStatus ? `on status ${selectedStatuses.map((s) => s.label).join(', ')}` : 'on submit';
       setFlash({
         appearance: 'success',
         title: 'Configuration saved',
-        text: `${mappings.length} field mapping${mappings.length === 1 ? '' : 's'} (${after} set after submit), ${wbCount} with write-back (${timing}).`
+        text: `${mappings.length} field mapping${mappings.length === 1 ? '' : 's'} (${after} set after submit), ${wbCount} with write-back (${timing}). A full sync of the select lists is running in the background.`
       });
       resetEditor();
       setEditId(null);
@@ -371,16 +411,15 @@ const App = () => {
   const syncNow = async () => {
     setBusy(true);
     try {
-      const res = (await invoke('runSyncNow')) || [];
-      const errors = res.filter((r) => r.error);
-      const assets = res.reduce((s, r) => s + (r.assets || 0), 0);
-      const created = res.reduce((s, r) => s + (r.created || 0), 0);
-      const updated = res.reduce((s, r) => s + (r.updated || 0), 0);
-      setFlash(errors.length
-        ? { appearance: 'error', title: 'Sync completed with errors', text: errors.map((e) => `${e.config}: ${e.error}`).join(' | ') }
-        : { appearance: 'success', title: 'Select lists synced', text: `${assets} assets checked, ${created} options created, ${updated} updated.` });
+      await invoke('runSyncNow');
+      await loadSyncStatus();
+      setFlash({
+        appearance: 'information',
+        title: 'Full sync started',
+        text: 'The sync runs in the background. Large lists can take a few minutes. Use "Refresh status" to see the result. Afterwards only changed objects are synced every 5 minutes.'
+      });
     } catch (e) {
-      setFlash({ appearance: 'error', title: 'Sync failed', text: String(e && e.message ? e.message : e) });
+      setFlash({ appearance: 'error', title: 'Sync could not be started', text: String(e && e.message ? e.message : e) });
     } finally {
       setBusy(false);
     }
@@ -404,6 +443,7 @@ const App = () => {
   const listRows = configs.map((c) => {
     const maps = c.mappings || [];
     const wb = maps.filter((m) => m.writeback).length;
+    const refs = maps.filter((m) => m.refObjectTypeId).length;
     const complete = c.objectTypeId && c.triggerField;
     return {
       key: c.id,
@@ -435,6 +475,7 @@ const App = () => {
               <Inline space="space.100" alignBlock="center">
                 <Badge>{maps.length}</Badge>
                 {wb ? <Lozenge appearance="success">{`${wb} write-back`}</Lozenge> : <Lozenge>Read only</Lozenge>}
+                {refs ? <Lozenge appearance="new">{`${refs} reference`}</Lozenge> : null}
               </Inline>
               {wb ? <Text>{timingLabel(c)}</Text> : null}
             </Stack>
@@ -454,53 +495,68 @@ const App = () => {
   });
 
   const renderList = () => (
-    <Box xcss={cardStyle}>
-      {configs.length ? (
-        <DynamicTable
-          head={{
-            cells: [
-              { key: 'desk', content: 'Service project' },
-              { key: 'rts', content: 'Request types' },
-              { key: 'source', content: 'Asset source' },
-              { key: 'trigger', content: 'Trigger field' },
-              { key: 'maps', content: 'Mappings' },
-              { key: 'actions', content: '' }
-            ]
-          }}
-          rows={listRows}
-        />
-      ) : (
-        <EmptyState
-          header="No configurations yet"
-          description="Define which portal forms load values from Assets and write changes back."
-          primaryAction={<Button appearance="primary" onClick={startNew}>Create configuration</Button>}
-        />
-      )}
-    </Box>
+    <Stack space="space.200">
+      <Box xcss={footerStyle}>
+        <Inline spread="space-between" alignBlock="center">
+          <Text>{syncStatusText(syncStatus)}</Text>
+          <Button appearance="subtle" onClick={loadSyncStatus} isDisabled={busy}>Refresh status</Button>
+        </Inline>
+      </Box>
+      <Box xcss={cardStyle}>
+        {configs.length ? (
+          <DynamicTable
+            head={{
+              cells: [
+                { key: 'desk', content: 'Service project' },
+                { key: 'rts', content: 'Request types' },
+                { key: 'source', content: 'Asset source' },
+                { key: 'trigger', content: 'Trigger field' },
+                { key: 'maps', content: 'Mappings' },
+                { key: 'actions', content: '' }
+              ]
+            }}
+            rows={listRows}
+          />
+        ) : (
+          <EmptyState
+            header="No configurations yet"
+            description="Define which portal forms load values from Assets and write changes back."
+            primaryAction={<Button appearance="primary" onClick={startNew}>Create configuration</Button>}
+          />
+        )}
+      </Box>
+    </Stack>
   );
 
   // -------------------------------------------------------------------------
   // View: editor
   // -------------------------------------------------------------------------
+  const attrLabel = (a) => {
+    let l = a.name;
+    if (a.isReference) l += ' → reference';
+    if (!a.editable) l += ' (read-only)';
+    return l;
+  };
+
   const baseAttrOptions = [{ label: '– Not mapped –', value: '' }].concat(
-    attributes.map((a) => ({ label: a.editable ? a.name : `${a.name} (read-only)`, value: a.name }))
+    attributes.map((a) => ({ label: attrLabel(a), value: a.name }))
   );
 
-  // Assets object fields: the selected asset itself or a reference attribute
   const assetsAttrOptions = () => {
     const refs = attributes.filter((a) => a.isReference);
     return [
       { label: '– Not mapped –', value: '' },
       { label: '(Selected asset)', value: SELF }
-    ].concat((refs.length ? refs : attributes).map((a) => ({ label: a.name, value: a.name })));
+    ].concat((refs.length ? refs : attributes).map((a) => ({ label: attrLabel(a), value: a.name })));
   };
 
   const mappingRows = mappableFields.map((f) => {
     const kind = fieldKind(f);
     const mode = fillModeOf(kind);
     const supported = mode !== null;
-    const row = mapping[f.id] || { attribute: '', writeback: false, manual: false };
-    const attr = attributes.find((a) => a.name === row.attribute);
+    const row = mapping[f.id] || { attribute: '', writeback: false, refAqlFilter: '', manual: false };
+    const attr = attrByName(row.attribute);
+    const ref = isRefList(kind, attr);
     const canWrite =
       supported && kind !== 'assets' && row.attribute !== SELF &&
       !!row.attribute && !!attr && attr.editable !== false;
@@ -508,6 +564,7 @@ const App = () => {
 
     let status = <Lozenge>Not mapped</Lozenge>;
     if (!supported) status = <Lozenge appearance="removed">Not supported</Lozenge>;
+    else if (ref) status = <Lozenge appearance="new">Synced list</Lozenge>;
     else if (row.attribute && !row.manual) status = <Lozenge appearance="success">Automatic</Lozenge>;
     else if (row.attribute) status = <Lozenge appearance="inprogress">Manual</Lozenge>;
 
@@ -535,16 +592,25 @@ const App = () => {
         {
           key: 'attr',
           content: (
-            <Select
-              options={options}
-              isDisabled={!supported}
-              value={supported ? options.find((o) => o.value === row.attribute) : options[0]}
-              onChange={(v) => {
-                const val = v ? v.value : '';
-                const a = attributes.find((x) => x.name === val);
-                setRow(f.id, { attribute: val, writeback: kind !== 'assets' && !!(a && a.editable) });
-              }}
-            />
+            <Stack space="space.100">
+              <Select
+                options={options}
+                isDisabled={!supported}
+                value={supported ? options.find((o) => o.value === row.attribute) : options[0]}
+                onChange={(v) => {
+                  const val = v ? v.value : '';
+                  const a = attrByName(val);
+                  setRow(f.id, { attribute: val, writeback: kind !== 'assets' && !!(a && a.editable) });
+                }}
+              />
+              {ref && (
+                <Textfield
+                  value={row.refAqlFilter || ''}
+                  placeholder='AQL filter for this list, e.g. Status = "Active"'
+                  onChange={(e) => setRow(f.id, { refAqlFilter: e.target.value })}
+                />
+              )}
+            </Stack>
           )
         },
         {
@@ -594,7 +660,7 @@ const App = () => {
           </Box>
         </Inline>
         <Box xcss={xcss({ maxWidth: '660px' })}>
-          <Field id="aql" label="Additional AQL filter (optional)" helper="Limits which objects can be selected in the portal.">
+          <Field id="aql" label="AQL filter for the trigger field (optional)" helper="Limits which objects can be selected in the trigger field.">
             <Textfield id="aql" value={aqlFilter} placeholder='e.g. Status = "Approved"' onChange={(e) => setAqlFilter(e.target.value)} />
           </Field>
         </Box>
@@ -652,8 +718,13 @@ const App = () => {
             <Text>Select request types and an object type to see the mapping.</Text>
           </SectionMessage>
         )}
+        {refWithoutType.length > 0 && (
+          <SectionMessage appearance="warning" title="Referenced object type not found">
+            <Text>{`Assets did not return the referenced object type for: ${refWithoutType.map((f) => f.name).join(', ')}. These lists cannot be synced.`}</Text>
+          </SectionMessage>
+        )}
         <SectionMessage appearance="information">
-          <Text>Select lists: the asset value must match the option name. Cascading select: use "Parent &gt; Child" in Assets. Assets object fields: choose "(Selected asset)" or a reference attribute.</Text>
+          <Text>Reference attributes (→ reference): map them to a select list and the app keeps that list synced with the objects of the referenced type. Use the AQL filter below the attribute to limit the list, e.g. Status = "Active". Large lists: after the first full sync only changed objects are synced every 5 minutes; a full sync runs once a day. Select lists with a normal attribute: the asset value must match the option name. Cascading select: use "Parent &gt; Child". Assets object fields: choose "(Selected asset)" or a reference attribute.</Text>
         </SectionMessage>
       </Section>
 
@@ -724,7 +795,7 @@ const App = () => {
           </Stack>
           {view === 'list' && (
             <ButtonGroup>
-              <Button onClick={syncNow} isDisabled={busy || !configs.length}>Sync select lists now</Button>
+              <Button onClick={syncNow} isDisabled={busy || !configs.length}>Full sync now</Button>
               <Button appearance="primary" onClick={startNew} isDisabled={busy}>New configuration</Button>
             </ButtonGroup>
           )}

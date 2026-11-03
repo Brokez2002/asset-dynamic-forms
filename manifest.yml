@@ -43,6 +43,7 @@ modules:
       handler: index.handler
     - key: sync
       handler: sync.runSync
+      timeoutSeconds: 900
     - key: sync-web
       handler: sync.runSyncWeb
     - key: writeback-create

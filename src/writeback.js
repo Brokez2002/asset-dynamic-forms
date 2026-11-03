@@ -96,6 +96,17 @@ const toAssetValues = (kind, v) => {
   }
 };
 
+// Reference list value ("KEY – Name" options) -> object keys
+const toReferenceKeys = (v) => {
+  const opts = Array.isArray(v) ? v : v ? [v] : [];
+  return opts
+    .map((o) => {
+      const mt = String(o && o.value !== undefined ? o.value : '').match(KEY_PATTERN);
+      return mt ? mt[1] : null;
+    })
+    .filter(Boolean);
+};
+
 // ---------------------------------------------------------------------------
 // Load request fields + selected asset
 // ---------------------------------------------------------------------------
@@ -136,7 +147,8 @@ const loadContext = async (issueKey, cfg) => {
     const list = (a.objectAttributeValues || []).map((v) => ({
       value: v.value !== undefined && v.value !== null ? v.value : null,
       display: v.displayValue !== undefined && v.displayValue !== null ? v.displayValue : null,
-      refId: v.referencedObject ? String(v.referencedObject.id) : null
+      refId: v.referencedObject ? String(v.referencedObject.id) : null,
+      refKey: v.referencedObject ? v.referencedObject.objectKey : null
     }));
     valuesById.set(String(a.objectTypeAttributeId), list);
     valuesByName[idToName.get(String(a.objectTypeAttributeId)) || String(a.objectTypeAttributeId)] = list;
@@ -246,13 +258,26 @@ const performWriteback = async (issueKey, cfg, ctx) => {
     const def = ctx.defs.find((d) => d.name === m.attribute);
     if (!def || def.editable === false || def.system) continue;
 
-    const newVals = toAssetValues(kindOfMapping(m), ctx.fields[m.field]);
-    if (!newVals) continue;
+    const current = ctx.valuesById.get(String(def.id)) || [];
+    let newVals;
+    let oldVals;
 
-    const oldVals = (ctx.valuesById.get(String(def.id)) || []).map((v) => (v.value === null ? '' : String(v.value)));
+    if (m.refObjectTypeId) {
+      // Reference list: option text "KEY – Name" -> object key(s)
+      newVals = toReferenceKeys(ctx.fields[m.field]);
+      if (!newVals.length) continue;
+      oldVals = current.map((x) => x.refKey).filter(Boolean);
+    } else {
+      newVals = toAssetValues(kindOfMapping(m), ctx.fields[m.field]);
+      if (!newVals) continue;
+      oldVals = current.map((x) => (x.value === null ? '' : String(x.value)));
+    }
+
     if ([...oldVals].sort().join('|') === [...newVals].sort().join('|')) continue;
 
-    console.log(`[ADF] ${ctx.objectKey}.${def.name}: ${JSON.stringify(oldVals)} -> ${JSON.stringify(newVals)} (from ${m.fieldName})`);
+    console.log(
+      `[ADF] ${ctx.objectKey}.${def.name}: ${JSON.stringify(oldVals)} -> ${JSON.stringify(newVals)} (from ${m.fieldName}${m.refObjectTypeId ? ', reference' : ''})`
+    );
     updates.push({ objectTypeAttributeId: def.id, objectAttributeValues: newVals.map((value) => ({ value })) });
   }
 

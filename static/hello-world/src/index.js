@@ -91,6 +91,26 @@ const convert = (m, kind, vals) => {
   }
 };
 
+// Reference list: linked object keys -> option IDs of the synced select list
+const convertReference = async (m, kind, vals) => {
+  const keys = vals.map((v) => v.refKey).filter(Boolean);
+  if (!keys.length) return { value: kind === 'multiselect' ? [] : null };
+
+  let map = {};
+  try {
+    map = (await invoke('resolveRefOptions', { fieldId: m.field, keys })) || {};
+  } catch (e) {
+    return { skip: `resolveRefOptions failed: ${e && e.message ? e.message : e}` };
+  }
+
+  const ids = keys.map((k) => map[k]).filter(Boolean);
+  const missing = keys.filter((k) => !map[k]);
+  if (missing.length) console.warn(`[ADF] ${m.fieldName}: no synced option for ${missing.join(', ')} (run sync?)`);
+
+  if (kind === 'multiselect') return { value: ids };
+  return ids.length ? { value: ids[0] } : { skip: `no synced option for ${keys[0]}` };
+};
+
 const isLive = (m) => (m.mode || 'live') === 'live';
 
 const ensureConfig = async (uiModifications) => {
@@ -158,12 +178,16 @@ uiModificationsApi.onChange(
         (result.attributes && result.attributes[m.attribute] !== undefined
           ? [{ value: result.attributes[m.attribute], display: result.attributes[m.attribute] }]
           : []);
-      const r = convert(m, kind, vals);
+
+      const r = m.refObjectTypeId
+        ? await convertReference(m, kind, vals)
+        : convert(m, kind, vals);
+
       if (r.skip) {
         console.log(`[ADF] Skipped ${m.fieldName}: ${r.skip}`);
         continue;
       }
-      console.log(`[ADF] ${m.fieldName} (${kind}) <- ${JSON.stringify(r.value)}`);
+      console.log(`[ADF] ${m.fieldName} (${kind}${m.refObjectTypeId ? ', reference' : ''}) <- ${JSON.stringify(r.value)}`);
       field.setValue(r.value);
     }
   },

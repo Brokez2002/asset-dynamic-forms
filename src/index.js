@@ -1,10 +1,11 @@
 import api, { route } from '@forge/api';
 import Resolver from '@forge/resolver';
 import { kvs } from '@forge/kvs';
-import { doSync } from './sync';
+import { requestSync, getSyncStatus, lookupRefOptions } from './sync';
 
 const UIM_NAME = 'asset-dynamic-forms';
 const JSON_HEADERS = { 'Content-Type': 'application/json', Accept: 'application/json' };
+const MAX_STORED_OPTIONS = 300; // larger lists are synced lists or must not be stored in the config
 
 // ---------------------------------------------------------------------------
 // Sync UI modifications with the stored configuration
@@ -95,7 +96,8 @@ resolver.define('getAssetByKey', async ({ payload }) => {
     const list = (a.objectAttributeValues || []).map((v) => ({
       value: v.value !== undefined && v.value !== null ? v.value : null,
       display: v.displayValue !== undefined && v.displayValue !== null ? v.displayValue : null,
-      refId: v.referencedObject ? String(v.referencedObject.id) : null
+      refId: v.referencedObject ? String(v.referencedObject.id) : null,
+      refKey: v.referencedObject ? v.referencedObject.objectKey : null
     }));
     values[name] = list;
     attributes[name] = list.length ? (list[0].value !== null ? list[0].value : list[0].display) : null;
@@ -127,7 +129,7 @@ resolver.define('getRequestTypes', async ({ payload }) => {
   return (data.values || []).map((r) => ({ id: r.id, name: r.name }));
 });
 
-// Form fields incl. type and valid options (for select-type fields)
+// Form fields incl. type; options only for small lists (large lists are synced lists)
 resolver.define('getRequestTypeFields', async ({ payload }) => {
   const { serviceDeskId, requestTypeIds } = payload;
   const byId = new Map();
@@ -142,15 +144,22 @@ resolver.define('getRequestTypeFields', async ({ payload }) => {
     const data = await res.json();
     for (const f of data.requestTypeFields || []) {
       if (byId.has(f.fieldId)) continue;
+      const valid = f.validValues || [];
+      const large = valid.length > MAX_STORED_OPTIONS;
+      if (large) console.log(`[ADF] Field ${f.fieldId} has ${valid.length} options, options not returned`);
       byId.set(f.fieldId, {
         id: f.fieldId,
         name: f.name,
         type: f.jiraSchema?.custom || f.jiraSchema?.system || f.jiraSchema?.type || '',
-        options: (f.validValues || []).map((v) => ({
-          id: String(v.value),
-          label: v.label,
-          children: (v.children || []).map((c) => ({ id: String(c.value), label: c.label }))
-        }))
+        optionCount: valid.length,
+        largeOptions: large,
+        options: large
+          ? []
+          : valid.map((v) => ({
+              id: String(v.value),
+              label: v.label,
+              children: (v.children || []).map((c) => ({ id: String(c.value), label: c.label }))
+            }))
       });
     }
   }
@@ -199,7 +208,12 @@ resolver.define('getAttributes', async ({ payload }) => {
       name: d.name,
       editable: d.editable !== false && !d.system,
       isReference: d.type === 1,
-      isUser: d.type === 2
+      isUser: d.type === 2,
+      refObjectTypeId: d.referenceObjectTypeId
+        ? String(d.referenceObjectTypeId)
+        : d.referenceObjectType && d.referenceObjectType.id
+          ? String(d.referenceObjectType.id)
+          : null
     }));
 });
 
@@ -226,20 +240,44 @@ resolver.define('getWorkflowStatuses', async ({ payload }) => {
   return Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name));
 });
 
-resolver.define('runSyncNow', async () => doSync());
+// Option IDs of a synced select list for the given asset keys (cached lookup)
+resolver.define('resolveRefOptions', async ({ payload }) => lookupRefOptions(payload.fieldId, payload.keys));
+
+// Full sync is only requested here; the scheduled trigger runs it within 5 minutes
+resolver.define('runSyncNow', async () => requestSync('admin'));
+resolver.define('getSyncStatus', async () => getSyncStatus());
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 resolver.define('getConfigs', async () => (await kvs.get('configs')) || []);
 
+// Remove large option lists before storing
+const slimConfig = (cfg) =>
+  Object.assign({}, cfg, {
+    mappings: (cfg.mappings || []).map((m) =>
+      Object.assign({}, m, {
+        options: (m.options || []).length > MAX_STORED_OPTIONS ? [] : m.options || []
+      })
+    )
+  });
+
 resolver.define('saveConfig', async ({ payload }) => {
   const configs = (await kvs.get('configs')) || [];
-  const cfg = Object.assign({}, payload, { id: payload.id || `cfg-${Date.now()}` });
+  const cfg = slimConfig(Object.assign({}, payload, { id: payload.id || `cfg-${Date.now()}` }));
   const idx = configs.findIndex((c) => c.id === cfg.id);
   if (idx >= 0) configs.splice(idx, 1, cfg);
   else configs.push(cfg);
-  await kvs.set('configs', configs);
+
+  const size = JSON.stringify(configs).length;
+  console.log(`[ADF] Saving ${configs.length} config(s), ${Math.round(size / 1024)} KB`);
+  try {
+    await kvs.set('configs', configs);
+  } catch (e) {
+    console.error(`[ADF] Storage error (${Math.round(size / 1024)} KB):`, e.message);
+    throw new Error(`Configuration could not be stored (${Math.round(size / 1024)} KB): ${e.message}`);
+  }
+
   try {
     await syncUimContexts();
   } catch (e) {
