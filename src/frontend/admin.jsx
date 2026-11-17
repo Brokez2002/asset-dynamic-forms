@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import ForgeReconciler, {
   Box, Stack, Inline, Heading, Text, Strong, Lozenge, Badge, Button, ButtonGroup,
   SectionMessage, DynamicTable, Select, Textfield, Toggle, Label, HelperMessage,
-  Spinner, EmptyState, xcss
+  Spinner, EmptyState, UserPicker, xcss
 } from '@forge/react';
 import { invoke } from '@forge/bridge';
 import { norm, kindOf, fillModeOf, OPTION_KINDS, KIND_LABELS } from '../fieldKinds';
@@ -19,6 +19,12 @@ const isSupported = (f) => fillModeOf(fieldKind(f)) !== null;
 
 // Select list mapped to a reference attribute -> options are synced from the referenced object type
 const isRefList = (kind, attr) => LIST_KINDS.includes(kind) && !!attr && !!attr.isReference;
+
+// UserPicker value(s) -> [{ accountId, name }]
+const toNotifyUsers = (v) =>
+  (Array.isArray(v) ? v : v ? [v] : [])
+    .map((u) => (typeof u === 'string' ? { accountId: u, name: '' } : { accountId: u.id || u.accountId, name: u.name || u.displayName || '' }))
+    .filter((u) => u.accountId);
 
 // Compute mapping: keep manual entries, otherwise match by name
 const computeMapping = (flds, attrs, prev) => {
@@ -53,7 +59,7 @@ const modeOf = (c) => (c && c.writebackMode === 'onStatus' ? 'onStatus' : 'onCre
 // Text for the last background sync
 const syncStatusText = (s) => {
   if (!s) return 'No sync has run yet.';
-  if (s.running) return `Sync (${s.mode || 'delta'}) running since ${new Date(s.startedAt).toLocaleString()}…`;
+  if (s.running) return `Sync (${s.mode || 'quick'}) running since ${new Date(s.startedAt).toLocaleString()}…`;
   if (s.error) return `Last sync ${new Date(s.at).toLocaleString()} failed: ${s.error}`;
   const res = s.results || [];
   const errors = res.filter((r) => r.error);
@@ -61,8 +67,11 @@ const syncStatusText = (s) => {
   const created = res.reduce((n, r) => n + (r.created || 0), 0);
   const updated = res.reduce((n, r) => n + (r.updated || 0), 0);
   const disabled = res.reduce((n, r) => n + (r.disabled || 0), 0);
-  let t = `Last sync (${s.mode || 'delta'}) ${new Date(s.at).toLocaleString()}: ${res.length} list${res.length === 1 ? '' : 's'}, ${assets} assets checked, ${created} created, ${updated} updated, ${disabled} disabled.`;
+  let t = s.at
+    ? `Last sync (${s.mode || 'quick'}) ${new Date(s.at).toLocaleString()}: ${res.length} list${res.length === 1 ? '' : 's'}, ${assets} assets checked, ${created} created, ${updated} updated, ${disabled} disabled.`
+    : 'No sync has run yet.';
   if (errors.length) t += ` Errors: ${errors.map((e) => `${e.field}: ${e.error}`).join(' | ')}`;
+  if (s.requested) t += ' A full sync is requested and starts within 5 minutes.';
   return t;
 };
 
@@ -120,6 +129,7 @@ const Field = ({ id, label, helper, children }) => (
 const App = () => {
   const [view, setView] = useState('list');
   const [editId, setEditId] = useState(null);
+  const [editorKey, setEditorKey] = useState(0);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [flash, setFlash] = useState(null);
@@ -146,6 +156,7 @@ const App = () => {
   const [writebackMode, setWritebackMode] = useState('onCreate');
   const [statuses, setStatuses] = useState([]);
   const [selectedStatuses, setSelectedStatuses] = useState([]);
+  const [notifyUsers, setNotifyUsers] = useState([]);
 
   const loadSyncStatus = async () => setSyncStatus((await invoke('getSyncStatus')) || null);
 
@@ -190,11 +201,13 @@ const App = () => {
     setWritebackMode('onCreate');
     setStatuses([]);
     setSelectedStatuses([]);
+    setNotifyUsers([]);
   };
 
   const startNew = () => {
     resetEditor();
     setEditId(null);
+    setEditorKey((k) => k + 1);
     setFlash(null);
     setView('edit');
   };
@@ -246,6 +259,9 @@ const App = () => {
       setStatuses(sts);
       const savedIds = (cfg.writebackStatusIds || []).map(String);
       setSelectedStatuses(sts.filter((s) => savedIds.includes(String(s.id))).map(opt));
+
+      setNotifyUsers(toNotifyUsers(cfg.notifyUsers || []));
+      setEditorKey((k) => k + 1); // re-mount UserPicker with the saved users
     } finally {
       setLoading(false);
     }
@@ -373,7 +389,8 @@ const App = () => {
         mappings,
         writebackMode,
         writebackStatusIds: onStatus ? selectedStatuses.map((s) => s.value) : [],
-        writebackStatusNames: onStatus ? selectedStatuses.map((s) => s.label) : []
+        writebackStatusNames: onStatus ? selectedStatuses.map((s) => s.label) : [],
+        notifyUsers
       });
       setConfigs(result || []);
 
@@ -386,7 +403,7 @@ const App = () => {
       setFlash({
         appearance: 'success',
         title: 'Configuration saved',
-        text: `${mappings.length} field mapping${mappings.length === 1 ? '' : 's'} (${after} set after submit), ${wbCount} with write-back (${timing}). A full sync of the select lists is running in the background.`
+        text: `${mappings.length} field mapping${mappings.length === 1 ? '' : 's'} (${after} set after submit), ${wbCount} with write-back (${timing}), ${notifyUsers.length} user(s) notified on errors. A full sync of the select lists starts within 5 minutes.`
       });
       resetEditor();
       setEditId(null);
@@ -415,11 +432,11 @@ const App = () => {
       await loadSyncStatus();
       setFlash({
         appearance: 'information',
-        title: 'Full sync started',
-        text: 'The sync runs in the background. Large lists can take a few minutes. Use "Refresh status" to see the result. Afterwards only changed objects are synced every 5 minutes.'
+        title: 'Full sync requested',
+        text: 'The full sync starts with the next scheduled run (within 5 minutes). Use "Refresh status" to see the result.'
       });
     } catch (e) {
-      setFlash({ appearance: 'error', title: 'Sync could not be started', text: String(e && e.message ? e.message : e) });
+      setFlash({ appearance: 'error', title: 'Sync could not be requested', text: String(e && e.message ? e.message : e) });
     } finally {
       setBusy(false);
     }
@@ -444,6 +461,7 @@ const App = () => {
     const maps = c.mappings || [];
     const wb = maps.filter((m) => m.writeback).length;
     const refs = maps.filter((m) => m.refObjectTypeId).length;
+    const notify = (c.notifyUsers || []).length;
     const complete = c.objectTypeId && c.triggerField;
     return {
       key: c.id,
@@ -478,6 +496,7 @@ const App = () => {
                 {refs ? <Lozenge appearance="new">{`${refs} reference`}</Lozenge> : null}
               </Inline>
               {wb ? <Text>{timingLabel(c)}</Text> : null}
+              {notify ? <Lozenge appearance="inprogress">{`${notify} notified on errors`}</Lozenge> : null}
             </Stack>
           )
         },
@@ -724,7 +743,7 @@ const App = () => {
           </SectionMessage>
         )}
         <SectionMessage appearance="information">
-          <Text>Reference attributes (→ reference): map them to a select list and the app keeps that list synced with the objects of the referenced type. Use the AQL filter below the attribute to limit the list, e.g. Status = "Active". Large lists: after the first full sync only changed objects are synced every 5 minutes; a full sync runs once a day. Select lists with a normal attribute: the asset value must match the option name. Cascading select: use "Parent &gt; Child". Assets object fields: choose "(Selected asset)" or a reference attribute.</Text>
+          <Text>Reference attributes (→ reference): map them to a select list and the app keeps that list synced with the objects of the referenced type. Use the AQL filter below the attribute to limit the list, e.g. Status = "Active". Select lists with a normal attribute: the asset value must match the option name. Cascading select: use "Parent &gt; Child". Assets object fields: choose "(Selected asset)" or a reference attribute.</Text>
         </SectionMessage>
       </Section>
 
@@ -746,7 +765,7 @@ const App = () => {
                 <Field
                   id="wbstatus"
                   label="Target status"
-                  helper="Write-back runs once when the request moves into one of these statuses. Choose the status after approval so rejected requests are not written back."
+                  helper="Write-back runs when the request moves into one of these statuses. Choose the status after approval so rejected requests are not written back."
                 >
                   <Select
                     id="wbstatus"
@@ -766,6 +785,25 @@ const App = () => {
             <Text>No field has write-back enabled. Turn on "Write back" for at least one field in step 4.</Text>
           </SectionMessage>
         )}
+      </Section>
+
+      <Section
+        step="6"
+        title="Error notifications"
+        description="These users get an e-mail from Jira when a write-back of this configuration fails or single fields could not be written. They must have permission to view the request."
+        aside={notifyUsers.length ? <Lozenge appearance="inprogress">{`${notifyUsers.length} user(s)`}</Lozenge> : null}
+      >
+        <Box xcss={xcss({ width: '480px' })}>
+          <UserPicker
+            key={`notify-${editorKey}`}
+            name="notifyUsers"
+            label="Notify users"
+            isMulti
+            placeholder="Search users"
+            defaultValue={notifyUsers.map((u) => u.accountId)}
+            onChange={(v) => setNotifyUsers(toNotifyUsers(v))}
+          />
+        </Box>
       </Section>
 
       <Box xcss={footerStyle}>

@@ -5,6 +5,8 @@ import { kindOf, norm } from './fieldKinds';
 const KEY_PATTERN = /^([A-Z][A-Z0-9]*-\d+)/;
 const JSON_HEADERS = { 'Content-Type': 'application/json', Accept: 'application/json' };
 const DONE_PROPERTY = 'adf-writeback-done';
+const ATTR_ERROR_KEY = /attribute-(\d+)$/;
+const MAX_RETRIES = 5;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -30,6 +32,10 @@ const findOption = (options, raw) => {
   const n = norm(raw);
   return (options || []).find((o) => norm(o.label) === n || String(o.id) === String(raw)) || null;
 };
+
+const escapeHtml = (s) =>
+  String(s === null || s === undefined ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 const getWorkspaceId = async () => {
   const res = await api.asApp().requestJira(route`/rest/servicedeskapi/assets/workspace`);
@@ -105,6 +111,52 @@ const toReferenceKeys = (v) => {
       return mt ? mt[1] : null;
     })
     .filter(Boolean);
+};
+
+// ---------------------------------------------------------------------------
+// Error notification to the users stored in the configuration (Jira "notify")
+// ---------------------------------------------------------------------------
+const notifyAccountIds = (cfg) =>
+  (cfg.notifyUsers || [])
+    .map((u) => (typeof u === 'string' ? u : u && u.accountId))
+    .filter(Boolean);
+
+const notifyErrors = async (issueKey, cfg, subject, lines) => {
+  const ids = notifyAccountIds(cfg);
+  if (!ids.length) return;
+
+  const textBody = `${subject}\n\n${lines.map((l) => `- ${l}`).join('\n')}\n\nRequest: ${issueKey}`;
+  const htmlBody =
+    `<p><b>${escapeHtml(subject)}</b></p><ul>${lines.map((l) => `<li>${escapeHtml(l)}</li>`).join('')}</ul>` +
+    `<p>Request: ${escapeHtml(issueKey)}</p>`;
+
+  const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issueKey}/notify`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({
+      subject: `[Asset Dynamic Forms] ${subject}`,
+      textBody,
+      htmlBody,
+      to: {
+        users: ids.map((accountId) => ({ accountId })),
+        reporter: false,
+        assignee: false,
+        watchers: false,
+        voters: false
+      }
+    })
+  });
+  if (!res.ok) console.error(`[ADF] ${issueKey}: notify failed ${res.status}: ${await res.text()}`);
+  else console.log(`[ADF] ${issueKey}: error notification sent to ${ids.length} user(s)`);
+};
+
+// A failing notification must never break the trigger
+const safeNotify = async (issueKey, cfg, subject, lines) => {
+  try {
+    await notifyErrors(issueKey, cfg, subject, lines);
+  } catch (e) {
+    console.error(`[ADF] ${issueKey}: notify error:`, e.message);
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -242,6 +294,109 @@ const prefillAfterSubmit = async (issueKey, cfg, ctx) => {
 };
 
 // ---------------------------------------------------------------------------
+// Assets update with per-attribute fallback
+// Invalid attributes (HTTP 400 with "...attribute-<id>" errors) are removed
+// and the remaining attributes are sent again.
+// ---------------------------------------------------------------------------
+const updateAssetPartial = async (ws, objectId, objectTypeId, attributes, info) => {
+  let remaining = attributes.slice();
+  const failed = [];
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (!remaining.length) return { updated: [], failed };
+
+    const res = await api.asApp().requestJira(route`/jsm/assets/workspace/${ws}/v1/object/${objectId}`, {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ objectTypeId, attributes: remaining })
+    });
+    if (res.ok) return { updated: remaining, failed };
+
+    const text = await res.text();
+    if (res.status !== 400) throw new Error(`Update ${res.status}: ${text}`);
+
+    let body = null;
+    try { body = JSON.parse(text); } catch (e) { /* not JSON */ }
+    const errors = (body && body.errors) || {};
+
+    const badIds = new Set();
+    for (const key of Object.keys(errors)) {
+      const mt = key.match(ATTR_ERROR_KEY);
+      if (!mt) continue;
+      const id = mt[1];
+      if (badIds.has(id)) continue;
+      badIds.add(id);
+      const attr = remaining.find((a) => String(a.objectTypeAttributeId) === id);
+      const i = info[id] || {};
+      failed.push({
+        attributeId: id,
+        attribute: i.attribute || `Attribute ${id}`,
+        field: i.fieldName || '-',
+        value: attr ? (attr.objectAttributeValues || []).map((v) => v.value).join(', ') : '',
+        reason: String(errors[key])
+      });
+    }
+
+    // 400 without attribute-specific errors -> real error
+    if (!badIds.size) throw new Error(`Update 400: ${text}`);
+
+    console.warn(`[ADF] Skipping invalid attribute(s) ${Array.from(badIds).join(', ')}, retrying`);
+    remaining = remaining.filter((a) => !badIds.has(String(a.objectTypeAttributeId)));
+  }
+
+  throw new Error(`Update failed after ${MAX_RETRIES} retries`);
+};
+
+// Internal comment (not visible to customers) listing the fields that were not written
+const commentFailures = async (issueKey, objectKey, failed) => {
+  if (!failed.length) return;
+
+  const adf = {
+    type: 'doc',
+    version: 1,
+    content: [
+      {
+        type: 'paragraph',
+        content: [{
+          type: 'text',
+          text: `Write-back to ${objectKey}: the following field(s) could not be updated in Assets. All other fields were updated.`
+        }]
+      },
+      {
+        type: 'bulletList',
+        content: failed.map((f) => ({
+          type: 'listItem',
+          content: [{
+            type: 'paragraph',
+            content: [
+              { type: 'text', text: f.field, marks: [{ type: 'strong' }] },
+              { type: 'text', text: ` → ${f.attribute}: value "${f.value}" – ${f.reason}` }
+            ]
+          }]
+        }))
+      },
+      {
+        type: 'paragraph',
+        content: [{
+          type: 'text',
+          text: 'Please correct the value (it must exactly match an allowed value in Assets) and move the request into the write-back status again.'
+        }]
+      }
+    ]
+  };
+
+  const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issueKey}/comment`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({
+      body: adf,
+      properties: [{ key: 'sd.public.comment', value: { internal: true } }]
+    })
+  });
+  if (!res.ok) console.error(`[ADF] ${issueKey}: comment failed ${res.status}: ${await res.text()}`);
+};
+
+// ---------------------------------------------------------------------------
 // Write changed values back to the asset
 // ---------------------------------------------------------------------------
 const performWriteback = async (issueKey, cfg, ctx) => {
@@ -254,6 +409,7 @@ const performWriteback = async (issueKey, cfg, ctx) => {
   }
 
   const updates = [];
+  const info = {}; // attribute id -> names for comment and mail
   for (const m of wbMappings) {
     const def = ctx.defs.find((d) => d.name === m.attribute);
     if (!def || def.editable === false || def.system) continue;
@@ -263,7 +419,6 @@ const performWriteback = async (issueKey, cfg, ctx) => {
     let oldVals;
 
     if (m.refObjectTypeId) {
-      // Reference list: option text "KEY – Name" -> object key(s)
       newVals = toReferenceKeys(ctx.fields[m.field]);
       if (!newVals.length) continue;
       oldVals = current.map((x) => x.refKey).filter(Boolean);
@@ -279,22 +434,30 @@ const performWriteback = async (issueKey, cfg, ctx) => {
       `[ADF] ${ctx.objectKey}.${def.name}: ${JSON.stringify(oldVals)} -> ${JSON.stringify(newVals)} (from ${m.fieldName}${m.refObjectTypeId ? ', reference' : ''})`
     );
     updates.push({ objectTypeAttributeId: def.id, objectAttributeValues: newVals.map((value) => ({ value })) });
+    info[String(def.id)] = { attribute: def.name, fieldName: m.fieldName };
   }
 
   if (!updates.length) {
     console.log(`[ADF] ${issueKey}: no changes for ${ctx.objectKey}`);
-    return { objectKey: ctx.objectKey, updated: 0 };
+    return { objectKey: ctx.objectKey, updated: 0, failed: [] };
   }
 
-  const upd = await api.asApp().requestJira(route`/jsm/assets/workspace/${ctx.ws}/v1/object/${ctx.obj.id}`, {
-    method: 'PUT',
-    headers: JSON_HEADERS,
-    body: JSON.stringify({ objectTypeId: cfg.objectTypeId, attributes: updates })
-  });
-  const body = await upd.text();
-  if (!upd.ok) throw new Error(`Update ${upd.status}: ${body}`);
-  console.log(`[ADF] ${issueKey}: ${updates.length} attribute(s) updated in ${ctx.objectKey}`);
-  return { objectKey: ctx.objectKey, updated: updates.length };
+  const { updated, failed } = await updateAssetPartial(ctx.ws, ctx.obj.id, cfg.objectTypeId, updates, info);
+
+  console.log(`[ADF] ${issueKey}: ${updated.length} attribute(s) updated in ${ctx.objectKey}`);
+  if (failed.length) {
+    console.warn(`[ADF] ${issueKey}: ${failed.length} attribute(s) skipped: ${failed.map((f) => `${f.attribute} ("${f.value}")`).join(', ')}`);
+    await commentFailures(issueKey, ctx.objectKey, failed);
+    await safeNotify(
+      issueKey,
+      cfg,
+      `Write-back ${issueKey} → ${ctx.objectKey}: ${failed.length} field(s) not updated`,
+      failed
+        .map((f) => `${f.field} → ${f.attribute}: value "${f.value}" – ${f.reason}`)
+        .concat([`${updated.length} other attribute(s) were updated successfully.`])
+    );
+  }
+  return { objectKey: ctx.objectKey, updated: updated.length, failed };
 };
 
 // ---------------------------------------------------------------------------
@@ -303,8 +466,9 @@ const performWriteback = async (issueKey, cfg, ctx) => {
 export async function onCreate(event) {
   const issueKey = event && event.issue ? event.issue.key : null;
   if (!issueKey) return;
+  let cfg = null;
   try {
-    const cfg = await findConfig(issueKey);
+    cfg = await findConfig(issueKey);
     if (!cfg) return;
 
     const maps = cfg.mappings || [];
@@ -321,6 +485,7 @@ export async function onCreate(event) {
     if (doWriteback) await performWriteback(issueKey, cfg, ctx);
   } catch (e) {
     console.error(`[ADF] Error on create (${issueKey}):`, e.message);
+    if (cfg) await safeNotify(issueKey, cfg, `Write-back ${issueKey} failed`, [e.message]);
   }
 }
 
@@ -335,8 +500,9 @@ export async function onUpdate(event) {
   const statusChange = items.find((i) => i.fieldId === 'status' || i.field === 'status');
   if (!statusChange) return;
 
+  let cfg = null;
   try {
-    const cfg = await findConfig(issueKey);
+    cfg = await findConfig(issueKey);
     if (!cfg || modeOf(cfg) !== 'onStatus') return;
 
     const targets = (cfg.writebackStatusIds || []).map(String);
@@ -354,8 +520,11 @@ export async function onUpdate(event) {
       return;
     }
     const result = await performWriteback(issueKey, cfg, ctx);
-    if (result) await markDone(issueKey, result.objectKey);
+
+    // Only mark as done when everything was written; otherwise a new status change retries
+    if (result && !(result.failed || []).length) await markDone(issueKey, result.objectKey);
   } catch (e) {
     console.error(`[ADF] Write-back error on status change (${issueKey}):`, e.message);
+    if (cfg) await safeNotify(issueKey, cfg, `Write-back ${issueKey} failed`, [e.message]);
   }
 }

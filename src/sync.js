@@ -6,8 +6,7 @@ const JSON_HEADERS = { 'Content-Type': 'application/json', Accept: 'application/
 const OPTION_BATCH = 1000;                      // options per create/update request
 const AQL_PAGE = 500;                           // assets per AQL page
 const BUCKET_SIZE = 800;                        // cached options per storage entry
-const FULL_SYNC_EVERY_MS = 24 * 60 * 60 * 1000; // full sync at least once a day
-const DELTA_BUFFER_MIN = 10;                    // overlap for delta syncs
+const FULL_SYNC_EVERY_MS = 24 * 60 * 60 * 1000; // full sync (against Jira options) once a day
 const LOCK_KEY = 'sync-lock';
 const STATUS_KEY = 'sync-status';
 const REQUEST_KEY = 'sync-request';
@@ -31,6 +30,22 @@ const chunk = (arr, size) => {
   return out;
 };
 
+// Fingerprint of an asset list (keys + labels) -> detects any change without reading the cache
+const fingerprint = (assets) => {
+  const s = assets
+    .map((a) => `${a.key}|${a.label}`)
+    .sort()
+    .join('\n');
+  let h1 = 0x811c9dc5;
+  let h2 = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 16777619) >>> 0;
+    h2 = (h2 * 31 + c) >>> 0;
+  }
+  return `${assets.length}:${h1.toString(16)}:${h2.toString(16)}`;
+};
+
 const getWorkspaceId = async () => {
   const res = await api.asApp().requestJira(route`/rest/servicedeskapi/assets/workspace`);
   if (!res.ok) throw new Error(`Workspace ${res.status}`);
@@ -44,6 +59,7 @@ const buildAql = (objectTypeId, filter) => {
   return extra ? `${base} AND (${extra})` : base;
 };
 
+// Keys and labels of all matching assets (no attributes -> fast, no KVS usage)
 const loadAssets = async (workspaceId, aql) => {
   const result = [];
   let startAt = 0;
@@ -88,7 +104,7 @@ const loadOptions = async (fieldId, contextId) => {
 // ---------------------------------------------------------------------------
 // Option cache (asset key -> [optionId, optionText, disabled])
 // ---------------------------------------------------------------------------
-const writeCache = async (fieldId, ctx, options) => {
+const writeCache = async (fieldId, ctx, options, oldN = 0) => {
   const n = Math.max(1, Math.ceil(options.length / BUCKET_SIZE));
   const buckets = Array.from({ length: n }, () => ({}));
   for (const o of options) {
@@ -96,6 +112,8 @@ const writeCache = async (fieldId, ctx, options) => {
     buckets[bucketOf(k, n)][k] = [String(o.id), o.value, !!o.disabled];
   }
   for (let i = 0; i < n; i++) await kvs.set(bucketKey(fieldId, ctx, i), buckets[i]);
+  // Remove buckets that are no longer used
+  for (let i = n; i < oldN; i++) await kvs.delete(bucketKey(fieldId, ctx, i));
   return n;
 };
 
@@ -121,17 +139,19 @@ const patchCache = async (fieldId, ctx, n, entries) => {
 };
 
 // ---------------------------------------------------------------------------
-// Full sync: all assets, all options, disables options of deleted assets
+// Full sync: compares against the real Jira options and rebuilds the cache
 // ---------------------------------------------------------------------------
-const fullSync = async (t, ws) => {
-  const assets = await loadAssets(ws, t.aql);
+const fullSync = async (t, assets) => {
   const assetKeys = new Set(assets.map((a) => a.key));
   const counts = { assets: assets.length, created: 0, updated: 0, disabled: 0 };
+  const oldMeta = (await kvs.get(metaKey(t.field))) || {};
+  const oldN = new Map((oldMeta.contexts || []).map((c) => [String(c.ctx), c.n]));
   const contexts = [];
 
   for (const ctx of await getContextIds(t.field)) {
     const options = await loadOptions(t.field, ctx);
     const byKey = new Map(options.map((o) => [optionKey(o.value), o]));
+    const activeCount = options.filter((o) => !o.disabled).length;
     const toCreate = [];
     const toUpdate = [];
 
@@ -142,10 +162,16 @@ const fullSync = async (t, ws) => {
       else if (existing.value !== wanted || existing.disabled)
         toUpdate.push({ id: existing.id, value: wanted, disabled: false });
     }
-    for (const o of options) {
-      if (!assetKeys.has(optionKey(o.value)) && !o.disabled) {
-        toUpdate.push({ id: o.id, value: o.value, disabled: true });
-        counts.disabled++;
+
+    // Safety: never disable everything because of an empty AQL result
+    if (!assets.length && activeCount) {
+      console.warn(`[ADF] Sync ${t.field}: AQL returned 0 assets, deletions skipped`);
+    } else {
+      for (const o of options) {
+        if (!assetKeys.has(optionKey(o.value)) && !o.disabled) {
+          toUpdate.push({ id: o.id, value: o.value, disabled: true });
+          counts.disabled++;
+        }
       }
     }
 
@@ -159,10 +185,10 @@ const fullSync = async (t, ws) => {
       if (!res.ok) throw new Error(`Update ${res.status}: ${await res.text()}`);
     }
     counts.created += toCreate.length;
-    counts.updated += toUpdate.length - toUpdate.filter((u) => u.disabled).length;
+    counts.updated += toUpdate.filter((u) => !u.disabled).length;
 
     const fresh = toCreate.length || toUpdate.length ? await loadOptions(t.field, ctx) : options;
-    contexts.push({ ctx, n: await writeCache(t.field, ctx, fresh) });
+    contexts.push({ ctx, n: await writeCache(t.field, ctx, fresh, oldN.get(String(ctx)) || 0) });
   }
 
   await kvs.set(metaKey(t.field), { contexts, at: new Date().toISOString() });
@@ -170,28 +196,36 @@ const fullSync = async (t, ws) => {
 };
 
 // ---------------------------------------------------------------------------
-// Delta sync: only assets changed since the last run, compared against the cache
+// Quick sync: only called when the fingerprint changed -> diff against cache
 // ---------------------------------------------------------------------------
-const deltaSync = async (t, ws, state) => {
+const quickSync = async (t, assets) => {
   const meta = await kvs.get(metaKey(t.field));
-  if (!meta || !(meta.contexts || []).length) return null;
+  if (!meta || !(meta.contexts || []).length) return null; // no cache yet -> full sync
 
-  const minutes = Math.ceil((Date.now() - state.lastRun) / 60000) + DELTA_BUFFER_MIN;
-  const assets = await loadAssets(ws, `(${t.aql}) AND Updated >= now(-${minutes}m)`);
+  const assetKeys = new Set(assets.map((a) => a.key));
   const counts = { assets: assets.length, created: 0, updated: 0, disabled: 0 };
-  if (!assets.length) return counts;
 
   let metaChanged = false;
   for (const c of meta.contexts) {
     const cache = await readCache(t.field, c.ctx, c.n);
+    const activeCount = Array.from(cache.values()).filter((e) => !e[2]).length;
     const toCreate = [];
     const toUpdate = [];
+    const toDisable = [];
 
     for (const a of assets) {
       const wanted = `${a.key}${SEP}${a.label}`;
       const e = cache.get(a.key);
       if (!e) toCreate.push({ value: wanted, disabled: false });
       else if (e[1] !== wanted || e[2]) toUpdate.push({ id: e[0], value: wanted, disabled: false });
+    }
+
+    if (!assets.length && activeCount) {
+      console.warn(`[ADF] Sync ${t.field}: AQL returned 0 assets, deletions skipped`);
+    } else {
+      for (const [k, e] of cache.entries()) {
+        if (!e[2] && !assetKeys.has(k)) toDisable.push({ id: e[0], value: e[1], disabled: true });
+      }
     }
 
     const base = route`/rest/api/3/field/${t.field}/context/${c.ctx}/option`;
@@ -205,16 +239,17 @@ const deltaSync = async (t, ws, state) => {
       if (createdOpts.length !== part.length) needReload = true;
       createdOpts.forEach((o) => { patches[optionKey(o.value)] = [String(o.id), o.value, false]; });
     }
-    for (const part of chunk(toUpdate, OPTION_BATCH)) {
+    for (const part of chunk(toUpdate.concat(toDisable), OPTION_BATCH)) {
       const res = await api.asApp().requestJira(base, { method: 'PUT', headers: JSON_HEADERS, body: JSON.stringify({ options: part }) });
       if (!res.ok) throw new Error(`Update ${res.status}: ${await res.text()}`);
-      part.forEach((u) => { patches[optionKey(u.value)] = [String(u.id), u.value, false]; });
+      part.forEach((u) => { patches[optionKey(u.value)] = [String(u.id), u.value, !!u.disabled]; });
     }
     counts.created += toCreate.length;
     counts.updated += toUpdate.length;
+    counts.disabled += toDisable.length;
 
     if (needReload) {
-      c.n = await writeCache(t.field, c.ctx, await loadOptions(t.field, c.ctx));
+      c.n = await writeCache(t.field, c.ctx, await loadOptions(t.field, c.ctx), c.n);
       metaChanged = true;
     } else if (Object.keys(patches).length) {
       await patchCache(t.field, c.ctx, c.n, patches);
@@ -250,26 +285,36 @@ const syncTarget = async (t, ws, mode) => {
     mode === 'full' || !state || state.aql !== t.aql || !state.lastFull ||
     started - state.lastFull > FULL_SYNC_EVERY_MS;
 
+  const assets = await loadAssets(ws, t.aql);
+  const fp = fingerprint(assets);
+
+  // Nothing changed in Assets -> no cache read at all
+  if (!needFull && state.fingerprint === fp) {
+    await kvs.set(stateKey(t.field), Object.assign({}, state, { lastRun: started }));
+    return { mode: 'unchanged', seconds: Math.round((Date.now() - started) / 1000), assets: assets.length, created: 0, updated: 0, disabled: 0 };
+  }
+
   let used = 'full';
   let r = null;
   if (!needFull) {
-    r = await deltaSync(t, ws, state);
-    used = 'delta';
+    r = await quickSync(t, assets);
+    used = 'quick';
   }
   if (!r) {
-    r = await fullSync(t, ws);
+    r = await fullSync(t, assets);
     used = 'full';
   }
 
   await kvs.set(stateKey(t.field), {
     aql: t.aql,
+    fingerprint: fp,
     lastRun: started,
     lastFull: used === 'full' ? started : state.lastFull
   });
   return Object.assign({ mode: used, seconds: Math.round((Date.now() - started) / 1000) }, r);
 };
 
-export const doSync = async (mode = 'delta') => {
+export const doSync = async (mode = 'quick') => {
   const configs = (await kvs.get('configs')) || [];
   const targets = collectTargets(configs);
   if (!targets.length) {
@@ -290,7 +335,9 @@ export const doSync = async (mode = 'delta') => {
     try {
       const r = await syncTarget(t, ws, mode);
       results.push(Object.assign({ config: t.config, field: t.field, type: t.type }, r));
-      console.log(`[ADF] Sync ${t.field} (${r.mode}): ${r.assets} assets, ${r.created} created, ${r.updated} updated, ${r.disabled} disabled, ${r.seconds}s`);
+      if (r.mode !== 'unchanged') {
+        console.log(`[ADF] Sync ${t.field} (${r.mode}): ${r.assets} assets, ${r.created} created, ${r.updated} updated, ${r.disabled} disabled, ${r.seconds}s`);
+      }
     } catch (e) {
       console.error(`[ADF] Sync error (${t.config}, ${t.field}):`, e.message);
       results.push({ config: t.config, field: t.field, error: e.message });
@@ -307,10 +354,13 @@ const runLocked = async (reason, mode) => {
     return null;
   }
   await kvs.set(LOCK_KEY, { at: Date.now(), reason });
-  await kvs.set(STATUS_KEY, { running: true, startedAt: new Date().toISOString(), reason, mode });
   try {
     const results = await doSync(mode);
-    await kvs.set(STATUS_KEY, { running: false, at: new Date().toISOString(), reason, mode, results });
+    // Only store a new status when something happened (saves storage traffic)
+    const changed = (results || []).some((r) => r.error || r.mode !== 'unchanged');
+    if (changed || mode === 'full') {
+      await kvs.set(STATUS_KEY, { running: false, at: new Date().toISOString(), reason, mode, results });
+    }
     return results;
   } catch (e) {
     await kvs.set(STATUS_KEY, { running: false, at: new Date().toISOString(), reason, mode, error: e.message });
@@ -323,15 +373,18 @@ const runLocked = async (reason, mode) => {
 // Request a full sync; it is picked up by the next scheduled run (max. 5 minutes)
 export const requestSync = async (reason = 'manual') => {
   await kvs.set(REQUEST_KEY, { reason, at: Date.now() });
-  const status = (await kvs.get(STATUS_KEY)) || {};
-  await kvs.set(STATUS_KEY, Object.assign({}, status, { requested: true, requestedAt: new Date().toISOString() }));
   console.log(`[ADF] Full sync requested (${reason})`);
   return { requested: true };
 };
 
-export const getSyncStatus = async () => (await kvs.get(STATUS_KEY)) || null;
+export const getSyncStatus = async () => {
+  const status = (await kvs.get(STATUS_KEY)) || null;
+  const request = await kvs.get(REQUEST_KEY);
+  if (!request) return status;
+  return Object.assign({}, status || {}, { requested: true, requestedAt: new Date(request.at).toISOString() });
+};
 
-// Fast lookup for the portal: asset keys -> option ids
+// Fast lookup for the portal: asset keys -> option ids (reads one bucket per key)
 export const lookupRefOptions = async (fieldId, keys) => {
   const result = {};
   const wanted = Array.from(new Set((keys || []).map(String)));
@@ -370,11 +423,11 @@ export const lookupRefOptions = async (fieldId, keys) => {
 // Entry points
 // ---------------------------------------------------------------------------
 
-// Scheduled trigger (every 5 minutes, up to 900 s): full sync if requested, otherwise delta
+// Scheduled trigger (every 5 minutes): full sync if requested, otherwise quick sync
 export const runSync = async () => {
   try {
     const request = await kvs.get(REQUEST_KEY);
-    const mode = request ? 'full' : 'delta';
+    const mode = request ? 'full' : 'quick';
     if (request) await kvs.delete(REQUEST_KEY);
     await runLocked(request ? request.reason : 'schedule', mode);
   } catch (e) {
