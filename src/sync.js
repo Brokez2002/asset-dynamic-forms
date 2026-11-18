@@ -12,6 +12,7 @@ const STATUS_KEY = 'sync-status';
 const REQUEST_KEY = 'sync-request';
 const MANAGED_KEY = 'sync-managed-fields';      // fields currently maintained by the sync
 const LOCK_TTL_MS = 14 * 60 * 1000;
+const NOT_IN_CONFIG = 'Not in any configuration';
 
 // Options created by the app always look like "ABC-123 – Name".
 // Only these are ever disabled by the app; manually created options are never touched.
@@ -35,6 +36,48 @@ const chunk = (arr, size) => {
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
 };
+
+// ---------------------------------------------------------------------------
+// Readable errors
+// ---------------------------------------------------------------------------
+
+// Error for a field that no longer exists in Jira (HTTP 404)
+const notFoundError = (fieldId) => {
+  const e = new Error(`Field ${fieldId} no longer exists in Jira`);
+  e.notFound = true;
+  return e;
+};
+
+// "Create 400: {json}" -> "Create 400: <messages>" (no raw JSON on the admin page)
+const shortError = (msg) => {
+  const s = String(msg || '');
+  const m = s.match(/^([A-Za-z]+ \d{3})(?: \([^)]*\))?: ([\s\S]*)$/);
+  if (m) {
+    try {
+      const j = JSON.parse(m[2]);
+      const parts = [].concat(j.errorMessages || [], Object.values(j.errors || {}));
+      if (parts.length) return `${m[1]}: ${parts.join('; ')}`;
+    } catch (e) { /* not JSON */ }
+    return `${m[1]}: ${m[2].slice(0, 300)}`;
+  }
+  return s.slice(0, 300);
+};
+
+// One entry for the admin page: severity, field, configuration, message
+const issue = (severity, t, message, extra = {}) =>
+  Object.assign(
+    {
+      severity,
+      field: t.field,
+      fieldName: t.fieldName || t.field,
+      config: t.config || null,
+      configLabel: t.configLabel || NOT_IN_CONFIG,
+      type: t.type,
+      message,
+      error: severity === 'error' ? message : undefined
+    },
+    extra
+  );
 
 // Fingerprint of an asset list (keys + labels) -> detects any change without reading the cache
 const fingerprint = (assets) => {
@@ -86,6 +129,7 @@ const loadAssets = async (workspaceId, aql) => {
 
 const getContextIds = async (fieldId) => {
   const res = await api.asApp().requestJira(route`/rest/api/3/field/${fieldId}/context`);
+  if (res.status === 404) throw notFoundError(fieldId);
   if (!res.ok) throw new Error(`Context ${res.status}: ${await res.text()}`);
   return ((await res.json()).values || []).map((c) => String(c.id));
 };
@@ -97,6 +141,7 @@ const loadOptions = async (fieldId, contextId) => {
     const res = await api.asApp().requestJira(
       route`/rest/api/3/field/${fieldId}/context/${contextId}/option?startAt=${startAt}&maxResults=1000`
     );
+    if (res.status === 404) throw notFoundError(fieldId);
     if (!res.ok) throw new Error(`Options ${res.status}: ${await res.text()}`);
     const data = await res.json();
     const values = data.values || [];
@@ -142,6 +187,16 @@ const patchCache = async (fieldId, ctx, n, entries) => {
     const cur = (await kvs.get(bucketKey(fieldId, ctx, b))) || {};
     await kvs.set(bucketKey(fieldId, ctx, b), Object.assign(cur, byBucket[b]));
   }
+};
+
+// Remove cache, meta and state of a field from storage
+const forgetField = async (fieldId) => {
+  const meta = await kvs.get(metaKey(fieldId));
+  for (const c of (meta && meta.contexts) || []) {
+    for (let i = 0; i < (c.n || 0); i++) await kvs.delete(bucketKey(fieldId, c.ctx, i));
+  }
+  await kvs.delete(metaKey(fieldId));
+  await kvs.delete(stateKey(fieldId));
 };
 
 // ---------------------------------------------------------------------------
@@ -242,6 +297,7 @@ const quickSync = async (t, assets) => {
 
     for (const part of chunk(toCreate, OPTION_BATCH)) {
       const res = await api.asApp().requestJira(base, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ options: part }) });
+      if (res.status === 404) throw notFoundError(t.field);
       if (!res.ok) throw new Error(`Create ${res.status}: ${await res.text()}`);
       const createdOpts = ((await res.json()) || {}).options || [];
       if (createdOpts.length !== part.length) needReload = true;
@@ -249,6 +305,7 @@ const quickSync = async (t, assets) => {
     }
     for (const part of chunk(toUpdate.concat(toDisable), OPTION_BATCH)) {
       const res = await api.asApp().requestJira(base, { method: 'PUT', headers: JSON_HEADERS, body: JSON.stringify({ options: part }) });
+      if (res.status === 404) throw notFoundError(t.field);
       if (!res.ok) throw new Error(`Update ${res.status}: ${await res.text()}`);
       part.forEach((u) => { patches[optionKey(u.value)] = [String(u.id), u.value, !!u.disabled]; });
     }
@@ -269,9 +326,8 @@ const quickSync = async (t, assets) => {
 };
 
 // ---------------------------------------------------------------------------
-// Cleanup of fields that are no longer synced (mapping removed, config deleted
-// or changed to a non-reference attribute): disable app-created options
-// "KEY – Name", keep manually created options, remove cache and state.
+// Cleanup of fields that are no longer synced (mapping removed, config deleted,
+// changed to a non-reference attribute or field deleted in Jira)
 // ---------------------------------------------------------------------------
 
 // One-time discovery of fields synced before this version (from stored sync state)
@@ -313,15 +369,7 @@ const cleanupField = async (fieldId) => {
     }
     disabled += toDisable.length;
   }
-
-  // Remove cache, meta and state of this field
-  const meta = await kvs.get(metaKey(fieldId));
-  for (const c of (meta && meta.contexts) || []) {
-    for (let i = 0; i < (c.n || 0); i++) await kvs.delete(bucketKey(fieldId, c.ctx, i));
-  }
-  await kvs.delete(metaKey(fieldId));
-  await kvs.delete(stateKey(fieldId));
-
+  await forgetField(fieldId);
   return { disabled, kept };
 };
 
@@ -334,13 +382,24 @@ const cleanupOrphans = async (currentFields) => {
   const results = [];
 
   for (const f of orphans) {
+    const t = { field: f, fieldName: f, config: null, configLabel: NOT_IN_CONFIG, type: 'cleanup' };
     try {
       const r = await cleanupField(f);
-      console.log(`[ADF] Cleanup ${f}: no longer synced, ${r.disabled} app option(s) disabled, ${r.kept} manual option(s) kept`);
-      results.push({ field: f, type: 'cleanup', mode: 'cleanup', assets: 0, created: 0, updated: 0, disabled: r.disabled });
+      const msg = `No longer synced: ${r.disabled} app option(s) disabled, ${r.kept} manual option(s) kept.`;
+      console.log(`[ADF] Cleanup ${f}: ${msg}`);
+      results.push(issue('info', t, msg, { mode: 'cleanup', disabled: r.disabled }));
     } catch (e) {
+      if (e.notFound) {
+        // Field was deleted in Jira -> stop tracking it, nothing left to clean up
+        await forgetField(f);
+        const msg = 'Field was deleted in Jira and is no longer used by any configuration. Removed from sync.';
+        console.log(`[ADF] Cleanup ${f}: ${msg}`);
+        results.push(issue('info', t, msg, { mode: 'cleanup' }));
+        continue;
+      }
+      const msg = `Cleanup failed, retried with the next run: ${shortError(e.message)}`;
       console.error(`[ADF] Cleanup error (${f}):`, e.message);
-      results.push({ field: f, type: 'cleanup', error: e.message });
+      results.push(issue('error', t, msg));
       current.add(f); // keep it managed so the cleanup is retried on the next run
     }
   }
@@ -353,15 +412,36 @@ const cleanupOrphans = async (currentFields) => {
 // ---------------------------------------------------------------------------
 // Targets: trigger fields + select lists mapped to reference attributes
 // ---------------------------------------------------------------------------
+const configLabelOf = (cfg) => {
+  const desk = cfg.serviceDeskName || `Service desk ${cfg.serviceDeskId || '-'}`;
+  const rts = (cfg.requestTypeNames || cfg.requestTypeIds || []).join(', ') || '-';
+  return `${desk} – ${rts}`;
+};
+
 const collectTargets = (configs) => {
   const targets = [];
   for (const cfg of configs) {
+    const configLabel = configLabelOf(cfg);
     if (cfg.triggerField && cfg.objectTypeId) {
-      targets.push({ config: cfg.id, field: cfg.triggerField, type: 'trigger', aql: buildAql(cfg.objectTypeId, cfg.aqlFilter) });
+      targets.push({
+        config: cfg.id,
+        configLabel,
+        field: cfg.triggerField,
+        fieldName: cfg.triggerFieldName || cfg.triggerField,
+        type: 'trigger',
+        aql: buildAql(cfg.objectTypeId, cfg.aqlFilter)
+      });
     }
     for (const m of cfg.mappings || []) {
       if (m.refObjectTypeId && (m.kind === 'select' || m.kind === 'multiselect')) {
-        targets.push({ config: cfg.id, field: m.field, type: 'reference', aql: buildAql(m.refObjectTypeId, m.refAqlFilter) });
+        targets.push({
+          config: cfg.id,
+          configLabel,
+          field: m.field,
+          fieldName: m.fieldName || m.field,
+          type: 'reference',
+          aql: buildAql(m.refObjectTypeId, m.refAqlFilter)
+        });
       }
     }
   }
@@ -423,24 +503,29 @@ export const doSync = async (mode = 'quick') => {
     const first = seen.get(t.field);
     if (first) {
       if (first.aql !== t.aql) {
-        // Same field with a different source/filter: only the first one is synced.
-        // Shown as error on the admin page, otherwise options of this config would silently be missing.
-        const msg = `Field is already synced by ${first.config} with a different source/AQL (${first.aql}). This config's AQL (${t.aql}) is ignored.`;
+        // Same field with a different source/filter: only the first one is synced
+        const msg =
+          `Also mapped in "${first.configLabel}" (${first.config}) with a different AQL filter. ` +
+          `Only that filter is used: ${first.aql}. Ignored here: ${t.aql}. ` +
+          'Use the same AQL filter in both configurations.';
         console.warn(`[ADF] Sync ${t.field} (${t.config}): ${msg}`);
-        results.push({ config: t.config, field: t.field, type: t.type, error: msg });
+        results.push(issue('warning', t, msg));
       }
       continue;
     }
     seen.set(t.field, t);
     try {
       const r = await syncTarget(t, ws, mode);
-      results.push(Object.assign({ config: t.config, field: t.field, type: t.type }, r));
+      results.push(Object.assign({ config: t.config, configLabel: t.configLabel, field: t.field, fieldName: t.fieldName, type: t.type }, r));
       if (r.mode !== 'unchanged') {
-        console.log(`[ADF] Sync ${t.field} (${r.mode}): ${r.assets} assets, ${r.created} created, ${r.updated} updated, ${r.disabled} disabled, ${r.seconds}s`);
+        console.log(`[ADF] Sync ${t.field} (${r.mode}, ${t.config}): ${r.assets} assets, ${r.created} created, ${r.updated} updated, ${r.disabled} disabled, ${r.seconds}s`);
       }
     } catch (e) {
+      const msg = e.notFound
+        ? 'Field no longer exists in Jira. Open this configuration with Edit and click Save changes to remove it from the mapping.'
+        : shortError(e.message);
       console.error(`[ADF] Sync error (${t.config}, ${t.field}):`, e.message);
-      results.push({ config: t.config, field: t.field, error: e.message });
+      results.push(issue('error', t, msg));
     }
   }
   return results;
@@ -463,13 +548,13 @@ const runLocked = async (reason, mode, request = null) => {
     }
     const results = await doSync(mode);
     // Only store a new status when something happened (saves storage traffic)
-    const changed = (results || []).some((r) => r.error || r.mode !== 'unchanged');
+    const changed = (results || []).some((r) => r.severity || r.error || r.mode !== 'unchanged');
     if (changed || mode === 'full') {
       await kvs.set(STATUS_KEY, { running: false, at: new Date().toISOString(), reason, mode, results });
     }
     return results;
   } catch (e) {
-    await kvs.set(STATUS_KEY, { running: false, at: new Date().toISOString(), reason, mode, error: e.message });
+    await kvs.set(STATUS_KEY, { running: false, at: new Date().toISOString(), reason, mode, error: shortError(e.message) });
     throw e;
   } finally {
     await kvs.delete(LOCK_KEY);

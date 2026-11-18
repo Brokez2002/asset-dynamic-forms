@@ -58,21 +58,35 @@ const MODE_OPTIONS = [
 ];
 const modeOf = (c) => (c && c.writebackMode === 'onStatus' ? 'onStatus' : 'onCreate');
 
-// Text for the last background sync
-const syncStatusText = (s) => {
-  if (!s) return 'No sync has run yet.';
+// ---------------------------------------------------------------------------
+// Sync status: short summary + list of issues
+// ---------------------------------------------------------------------------
+const SEVERITY_ORDER = { error: 0, warning: 1, info: 2 };
+const SEVERITY_LOZENGE = { error: 'removed', warning: 'moved', info: 'default' };
+
+const syncIssues = (s) =>
+  ((s && s.results) || [])
+    .filter((r) => r.severity || r.error)
+    .map((r) => ({
+      severity: r.severity || 'error',
+      field: r.field,
+      fieldName: r.fieldName || r.field,
+      config: r.config || null,
+      configLabel: r.configLabel || (r.config ? '' : 'Not in any configuration'),
+      message: r.message || r.error
+    }))
+    .sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]);
+
+const syncSummary = (s) => {
+  if (!s || (!s.at && !s.running)) return s && s.requested ? 'A full sync is requested and starts within 5 minutes.' : 'No sync has run yet.';
   if (s.running) return `Sync (${s.mode || 'quick'}) running since ${new Date(s.startedAt).toLocaleString()}…`;
   if (s.error) return `Last sync ${new Date(s.at).toLocaleString()} failed: ${s.error}`;
-  const res = s.results || [];
-  const errors = res.filter((r) => r.error);
-  const assets = res.reduce((n, r) => n + (r.assets || 0), 0);
-  const created = res.reduce((n, r) => n + (r.created || 0), 0);
-  const updated = res.reduce((n, r) => n + (r.updated || 0), 0);
-  const disabled = res.reduce((n, r) => n + (r.disabled || 0), 0);
-  let t = s.at
-    ? `Last sync (${s.mode || 'quick'}) ${new Date(s.at).toLocaleString()}: ${res.length} list${res.length === 1 ? '' : 's'}, ${assets} assets checked, ${created} created, ${updated} updated, ${disabled} disabled.`
-    : 'No sync has run yet.';
-  if (errors.length) t += ` Errors: ${errors.map((e) => `${e.field}: ${e.error}`).join(' | ')}`;
+  const lists = (s.results || []).filter((r) => ['full', 'quick', 'unchanged'].includes(r.mode));
+  const sum = (k) => lists.reduce((n, r) => n + (r[k] || 0), 0);
+  const issues = syncIssues(s);
+  const count = (sev) => issues.filter((i) => i.severity === sev).length;
+  let t = `Last sync (${s.mode || 'quick'}) ${new Date(s.at).toLocaleString()}: ${lists.length} list${lists.length === 1 ? '' : 's'}, ${sum('assets')} assets checked, ${sum('created')} created, ${sum('updated')} updated, ${sum('disabled')} disabled.`;
+  if (issues.length) t += ` ${count('error')} error(s), ${count('warning')} warning(s), ${count('info')} info.`;
   if (s.requested) t += ' A full sync is requested and starts within 5 minutes.';
   return t;
 };
@@ -464,6 +478,11 @@ const App = () => {
     return d ? d.name : `Service desk ${c.serviceDeskId || '-'}`;
   };
 
+  const configLabel = (id) => {
+    const c = configs.find((x) => x.id === id);
+    return c ? `${deskName(c)} – ${(c.requestTypeNames || c.requestTypeIds || []).join(', ') || '-'}` : '';
+  };
+
   const timingLabel = (c) => {
     if (modeOf(c) !== 'onStatus') return 'On submit';
     const names = c.writebackStatusNames || c.writebackStatusIds || [];
@@ -484,6 +503,7 @@ const App = () => {
           content: (
             <Stack space="space.050">
               <Strong>{deskName(c)}</Strong>
+              <Text>{c.id}</Text>
               {!complete && <Lozenge appearance="moved">Incomplete</Lozenge>}
             </Stack>
           )
@@ -526,13 +546,58 @@ const App = () => {
     };
   });
 
+  // Issues of the last sync as a table
+  const issues = syncIssues(syncStatus);
+  const issueRows = issues.map((i, idx) => ({
+    key: `issue-${idx}`,
+    cells: [
+      { key: 'sev', content: <Lozenge appearance={SEVERITY_LOZENGE[i.severity] || 'default'}>{i.severity}</Lozenge> },
+      {
+        key: 'field',
+        content: (
+          <Stack space="space.025">
+            <Strong>{i.fieldName}</Strong>
+            {i.fieldName !== i.field ? <Text>{i.field}</Text> : null}
+          </Stack>
+        )
+      },
+      {
+        key: 'config',
+        content: i.config ? (
+          <Stack space="space.025">
+            <Text>{i.configLabel || configLabel(i.config) || '-'}</Text>
+            <Text>{i.config}</Text>
+          </Stack>
+        ) : (
+          <Text>Not in any configuration</Text>
+        )
+      },
+      { key: 'msg', content: <Text>{i.message}</Text> }
+    ]
+  }));
+
   const renderList = () => (
     <Stack space="space.200">
       <Box xcss={footerStyle}>
-        <Inline spread="space-between" alignBlock="center">
-          <Text>{syncStatusText(syncStatus)}</Text>
-          <Button appearance="subtle" onClick={loadSyncStatus} isDisabled={busy}>Refresh status</Button>
-        </Inline>
+        <Stack space="space.150">
+          <Inline spread="space-between" alignBlock="center">
+            <Text>{syncSummary(syncStatus)}</Text>
+            <Button appearance="subtle" onClick={loadSyncStatus} isDisabled={busy}>Refresh status</Button>
+          </Inline>
+          {issueRows.length > 0 && (
+            <DynamicTable
+              head={{
+                cells: [
+                  { key: 'sev', content: 'Severity' },
+                  { key: 'field', content: 'Field' },
+                  { key: 'config', content: 'Configuration' },
+                  { key: 'msg', content: 'Details' }
+                ]
+              }}
+              rows={issueRows}
+            />
+          )}
+        </Stack>
       </Box>
       <Box xcss={cardStyle}>
         {configs.length ? (
@@ -571,7 +636,7 @@ const App = () => {
           <ModalBody>
             <Stack space="space.150">
               <Text>
-                {`Service project: ${deskName(confirmDelete)} · Request types: ${(confirmDelete.requestTypeNames || confirmDelete.requestTypeIds || []).join(', ') || '-'} · Asset source: ${confirmDelete.objectTypeName || '-'}`}
+                {`Service project: ${deskName(confirmDelete)} · Request types: ${(confirmDelete.requestTypeNames || confirmDelete.requestTypeIds || []).join(', ') || '-'} · Asset source: ${confirmDelete.objectTypeName || '-'} · ID: ${confirmDelete.id}`}
               </Text>
               <SectionMessage appearance="warning">
                 <Text>
@@ -872,7 +937,7 @@ const App = () => {
       <Stack space="space.300">
         <Inline spread="space-between" alignBlock="center">
           <Stack space="space.050">
-            <Heading as="h2">{view === 'edit' ? (editId ? 'Edit configuration' : 'New configuration') : 'Asset Dynamic Forms'}</Heading>
+            <Heading as="h2">{view === 'edit' ? (editId ? `Edit configuration (${editId})` : 'New configuration') : 'Asset Dynamic Forms'}</Heading>
             <Text>Fills portal forms with values from Assets and writes changes back.</Text>
           </Stack>
           {view === 'list' && (
