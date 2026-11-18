@@ -2,7 +2,9 @@ import React, { useEffect, useState } from 'react';
 import ForgeReconciler, {
   Box, Stack, Inline, Heading, Text, Strong, Lozenge, Badge, Button, ButtonGroup,
   SectionMessage, DynamicTable, Select, Textfield, Toggle, Label, HelperMessage,
-  Spinner, EmptyState, UserPicker, xcss
+  Spinner, EmptyState, UserPicker,
+  Modal, ModalBody, ModalFooter, ModalHeader, ModalTitle, ModalTransition,
+  xcss
 } from '@forge/react';
 import { invoke } from '@forge/bridge';
 import { norm, kindOf, fillModeOf, OPTION_KINDS, KIND_LABELS } from '../fieldKinds';
@@ -134,6 +136,7 @@ const App = () => {
   const [busy, setBusy] = useState(false);
   const [flash, setFlash] = useState(null);
   const [syncStatus, setSyncStatus] = useState(null);
+  const [confirmDelete, setConfirmDelete] = useState(null); // config waiting for delete confirmation
 
   const [configs, setConfigs] = useState([]);
   const [desks, setDesks] = useState([]);
@@ -415,11 +418,21 @@ const App = () => {
     }
   };
 
-  const remove = async (id) => {
+  // Delete only after confirmation in the modal
+  const confirmRemove = async () => {
+    const cfg = confirmDelete;
+    setConfirmDelete(null);
+    if (!cfg) return;
     setBusy(true);
     try {
-      setConfigs((await invoke('deleteConfig', { id })) || []);
-      setFlash({ appearance: 'information', title: 'Configuration deleted', text: 'The related portal contexts have been removed.' });
+      setConfigs((await invoke('deleteConfig', { id: cfg.id })) || []);
+      setFlash({
+        appearance: 'information',
+        title: 'Configuration deleted',
+        text: 'The related portal contexts have been removed. Select lists that were only synced by this configuration are cleaned up with the next sync run (only app-created options are disabled).'
+      });
+    } catch (e) {
+      setFlash({ appearance: 'error', title: 'Deleting failed', text: String(e && e.message ? e.message : e) });
     } finally {
       setBusy(false);
     }
@@ -505,7 +518,7 @@ const App = () => {
           content: (
             <ButtonGroup>
               <Button appearance="subtle" onClick={() => startEdit(c)} isDisabled={busy}>Edit</Button>
-              <Button appearance="subtle" onClick={() => remove(c.id)} isDisabled={busy}>Delete</Button>
+              <Button appearance="subtle" onClick={() => setConfirmDelete(c)} isDisabled={busy}>Delete</Button>
             </ButtonGroup>
           )
         }
@@ -545,6 +558,37 @@ const App = () => {
         )}
       </Box>
     </Stack>
+  );
+
+  // Confirmation dialog for deleting a configuration
+  const renderDeleteModal = () => (
+    <ModalTransition>
+      {confirmDelete && (
+        <Modal onClose={() => setConfirmDelete(null)}>
+          <ModalHeader>
+            <ModalTitle appearance="danger">Delete configuration?</ModalTitle>
+          </ModalHeader>
+          <ModalBody>
+            <Stack space="space.150">
+              <Text>
+                {`Service project: ${deskName(confirmDelete)} · Request types: ${(confirmDelete.requestTypeNames || confirmDelete.requestTypeIds || []).join(', ') || '-'} · Asset source: ${confirmDelete.objectTypeName || '-'}`}
+              </Text>
+              <SectionMessage appearance="warning">
+                <Text>
+                  The portal forms of these request types are no longer filled from Assets and no write-back happens anymore.
+                  Select lists that are only synced by this configuration are cleaned up with the next sync run (app-created options are disabled, manual options stay).
+                  This cannot be undone.
+                </Text>
+              </SectionMessage>
+            </Stack>
+          </ModalBody>
+          <ModalFooter>
+            <Button appearance="subtle" onClick={() => setConfirmDelete(null)}>Cancel</Button>
+            <Button appearance="danger" onClick={confirmRemove}>Delete configuration</Button>
+          </ModalFooter>
+        </Modal>
+      )}
+    </ModalTransition>
   );
 
   // -------------------------------------------------------------------------
@@ -852,6 +896,8 @@ const App = () => {
         ) : null}
 
         {!loading && (view === 'list' ? renderList() : renderEditor())}
+
+        {renderDeleteModal()}
       </Stack>
     </Box>
   );

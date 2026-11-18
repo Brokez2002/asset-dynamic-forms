@@ -1,5 +1,5 @@
 import api, { route } from '@forge/api';
-import { kvs } from '@forge/kvs';
+import { kvs, WhereConditions } from '@forge/kvs';
 
 const SEP = ' – ';
 const JSON_HEADERS = { 'Content-Type': 'application/json', Accept: 'application/json' };
@@ -10,7 +10,13 @@ const FULL_SYNC_EVERY_MS = 24 * 60 * 60 * 1000; // full sync (against Jira optio
 const LOCK_KEY = 'sync-lock';
 const STATUS_KEY = 'sync-status';
 const REQUEST_KEY = 'sync-request';
+const MANAGED_KEY = 'sync-managed-fields';      // fields currently maintained by the sync
 const LOCK_TTL_MS = 14 * 60 * 1000;
+
+// Options created by the app always look like "ABC-123 – Name".
+// Only these are ever disabled by the app; manually created options are never touched.
+const APP_OPTION = /^[A-Z][A-Z0-9]*-\d+ – /;
+const isAppOption = (value) => APP_OPTION.test(String(value));
 
 const optionKey = (value) => String(value).split(' ')[0];
 const safe = (s) => String(s).replace(/[^a-zA-Z0-9:.-]/g, '-');
@@ -151,7 +157,7 @@ const fullSync = async (t, assets) => {
   for (const ctx of await getContextIds(t.field)) {
     const options = await loadOptions(t.field, ctx);
     const byKey = new Map(options.map((o) => [optionKey(o.value), o]));
-    const activeCount = options.filter((o) => !o.disabled).length;
+    const activeAppCount = options.filter((o) => !o.disabled && isAppOption(o.value)).length;
     const toCreate = [];
     const toUpdate = [];
 
@@ -164,11 +170,12 @@ const fullSync = async (t, assets) => {
     }
 
     // Safety: never disable everything because of an empty AQL result
-    if (!assets.length && activeCount) {
+    if (!assets.length && activeAppCount) {
       console.warn(`[ADF] Sync ${t.field}: AQL returned 0 assets, deletions skipped`);
     } else {
       for (const o of options) {
-        if (!assetKeys.has(optionKey(o.value)) && !o.disabled) {
+        // Only app-created options ("KEY – Name") are disabled, manual options stay untouched
+        if (!o.disabled && isAppOption(o.value) && !assetKeys.has(optionKey(o.value))) {
           toUpdate.push({ id: o.id, value: o.value, disabled: true });
           counts.disabled++;
         }
@@ -208,7 +215,7 @@ const quickSync = async (t, assets) => {
   let metaChanged = false;
   for (const c of meta.contexts) {
     const cache = await readCache(t.field, c.ctx, c.n);
-    const activeCount = Array.from(cache.values()).filter((e) => !e[2]).length;
+    const activeAppCount = Array.from(cache.values()).filter((e) => !e[2] && isAppOption(e[1])).length;
     const toCreate = [];
     const toUpdate = [];
     const toDisable = [];
@@ -220,11 +227,12 @@ const quickSync = async (t, assets) => {
       else if (e[1] !== wanted || e[2]) toUpdate.push({ id: e[0], value: wanted, disabled: false });
     }
 
-    if (!assets.length && activeCount) {
+    if (!assets.length && activeAppCount) {
       console.warn(`[ADF] Sync ${t.field}: AQL returned 0 assets, deletions skipped`);
     } else {
       for (const [k, e] of cache.entries()) {
-        if (!e[2] && !assetKeys.has(k)) toDisable.push({ id: e[0], value: e[1], disabled: true });
+        // Only app-created options are disabled
+        if (!e[2] && isAppOption(e[1]) && !assetKeys.has(k)) toDisable.push({ id: e[0], value: e[1], disabled: true });
       }
     }
 
@@ -258,6 +266,88 @@ const quickSync = async (t, assets) => {
 
   if (metaChanged) await kvs.set(metaKey(t.field), Object.assign(meta, { at: new Date().toISOString() }));
   return counts;
+};
+
+// ---------------------------------------------------------------------------
+// Cleanup of fields that are no longer synced (mapping removed, config deleted
+// or changed to a non-reference attribute): disable app-created options
+// "KEY – Name", keep manually created options, remove cache and state.
+// ---------------------------------------------------------------------------
+
+// One-time discovery of fields synced before this version (from stored sync state)
+const discoverManagedFields = async () => {
+  const fields = new Set();
+  try {
+    let cursor;
+    do {
+      let q = kvs.query().where('key', WhereConditions.beginsWith('syncstate:')).limit(100);
+      if (cursor) q = q.cursor(cursor);
+      const page = await q.getMany();
+      (page.results || []).forEach((r) => {
+        const m = String(r.key).match(/^syncstate:customfield-(\d+)$/);
+        if (m) fields.add(`customfield_${m[1]}`);
+      });
+      cursor = page.nextCursor;
+    } while (cursor);
+  } catch (e) {
+    console.warn('[ADF] Cleanup: could not discover synced fields:', e.message);
+  }
+  return Array.from(fields);
+};
+
+const cleanupField = async (fieldId) => {
+  let disabled = 0;
+  let kept = 0;
+  for (const ctx of await getContextIds(fieldId)) {
+    const options = await loadOptions(fieldId, ctx);
+    const toDisable = [];
+    for (const o of options) {
+      if (o.disabled) continue;
+      if (isAppOption(o.value)) toDisable.push({ id: o.id, value: o.value, disabled: true });
+      else kept++;
+    }
+    const base = route`/rest/api/3/field/${fieldId}/context/${ctx}/option`;
+    for (const part of chunk(toDisable, OPTION_BATCH)) {
+      const res = await api.asApp().requestJira(base, { method: 'PUT', headers: JSON_HEADERS, body: JSON.stringify({ options: part }) });
+      if (!res.ok) throw new Error(`Cleanup ${res.status}: ${await res.text()}`);
+    }
+    disabled += toDisable.length;
+  }
+
+  // Remove cache, meta and state of this field
+  const meta = await kvs.get(metaKey(fieldId));
+  for (const c of (meta && meta.contexts) || []) {
+    for (let i = 0; i < (c.n || 0); i++) await kvs.delete(bucketKey(fieldId, c.ctx, i));
+  }
+  await kvs.delete(metaKey(fieldId));
+  await kvs.delete(stateKey(fieldId));
+
+  return { disabled, kept };
+};
+
+const cleanupOrphans = async (currentFields) => {
+  let managed = await kvs.get(MANAGED_KEY);
+  if (!Array.isArray(managed)) managed = await discoverManagedFields();
+
+  const current = new Set(currentFields);
+  const orphans = managed.filter((f) => !current.has(f));
+  const results = [];
+
+  for (const f of orphans) {
+    try {
+      const r = await cleanupField(f);
+      console.log(`[ADF] Cleanup ${f}: no longer synced, ${r.disabled} app option(s) disabled, ${r.kept} manual option(s) kept`);
+      results.push({ field: f, type: 'cleanup', mode: 'cleanup', assets: 0, created: 0, updated: 0, disabled: r.disabled });
+    } catch (e) {
+      console.error(`[ADF] Cleanup error (${f}):`, e.message);
+      results.push({ field: f, type: 'cleanup', error: e.message });
+      current.add(f); // keep it managed so the cleanup is retried on the next run
+    }
+  }
+
+  const next = Array.from(current).sort();
+  if (JSON.stringify(next) !== JSON.stringify([...managed].sort())) await kvs.set(MANAGED_KEY, next);
+  return results;
 };
 
 // ---------------------------------------------------------------------------
@@ -317,21 +407,31 @@ const syncTarget = async (t, ws, mode) => {
 export const doSync = async (mode = 'quick') => {
   const configs = (await kvs.get('configs')) || [];
   const targets = collectTargets(configs);
+
+  // Clean up fields that dropped out of the sync (also when no targets are left)
+  const results = await cleanupOrphans(Array.from(new Set(targets.map((t) => t.field))));
+
   if (!targets.length) {
     console.log('[ADF] Sync: nothing to sync');
-    return [];
+    return results;
   }
 
   const ws = await getWorkspaceId();
-  const seen = new Set();
-  const results = [];
+  const seen = new Map(); // field -> first target that syncs it
 
   for (const t of targets) {
-    if (seen.has(t.field)) {
-      console.warn(`[ADF] Sync: ${t.field} already synced by another mapping, skipped (${t.config})`);
+    const first = seen.get(t.field);
+    if (first) {
+      if (first.aql !== t.aql) {
+        // Same field with a different source/filter: only the first one is synced.
+        // Shown as error on the admin page, otherwise options of this config would silently be missing.
+        const msg = `Field is already synced by ${first.config} with a different source/AQL (${first.aql}). This config's AQL (${t.aql}) is ignored.`;
+        console.warn(`[ADF] Sync ${t.field} (${t.config}): ${msg}`);
+        results.push({ config: t.config, field: t.field, type: t.type, error: msg });
+      }
       continue;
     }
-    seen.add(t.field);
+    seen.set(t.field, t);
     try {
       const r = await syncTarget(t, ws, mode);
       results.push(Object.assign({ config: t.config, field: t.field, type: t.type }, r));
@@ -346,15 +446,21 @@ export const doSync = async (mode = 'quick') => {
   return results;
 };
 
-// One sync at a time, result is stored for the admin page
-const runLocked = async (reason, mode) => {
+// One sync at a time, result is stored for the admin page.
+// A pending full-sync request is only removed once this run actually holds the lock.
+const runLocked = async (reason, mode, request = null) => {
   const lock = await kvs.get(LOCK_KEY);
   if (lock && Date.now() - lock.at < LOCK_TTL_MS) {
     console.log(`[ADF] Sync already running since ${new Date(lock.at).toISOString()}, skipped (${reason})`);
-    return null;
+    return null; // request stays stored and is picked up by the next run
   }
   await kvs.set(LOCK_KEY, { at: Date.now(), reason });
   try {
+    if (request) {
+      // Only delete exactly this request; a newer one (e.g. saved during the run) stays
+      const current = await kvs.get(REQUEST_KEY);
+      if (current && current.at === request.at) await kvs.delete(REQUEST_KEY);
+    }
     const results = await doSync(mode);
     // Only store a new status when something happened (saves storage traffic)
     const changed = (results || []).some((r) => r.error || r.mode !== 'unchanged');
@@ -428,8 +534,7 @@ export const runSync = async () => {
   try {
     const request = await kvs.get(REQUEST_KEY);
     const mode = request ? 'full' : 'quick';
-    if (request) await kvs.delete(REQUEST_KEY);
-    await runLocked(request ? request.reason : 'schedule', mode);
+    await runLocked(request ? request.reason : 'schedule', mode, request);
   } catch (e) {
     console.error('[ADF] Sync error:', e.message);
   }
